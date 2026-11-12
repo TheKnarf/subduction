@@ -198,6 +198,43 @@ in {
         };
       };
 
+      veilid = {
+        enable = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            Enable the Veilid transport (anonymous P2P over Veilid private
+            routes). The node's route blob is logged at startup and written to
+            the ready file as `veilid_route`.
+          '';
+        };
+
+        peers = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [];
+          example = ["ARAeUAECAQJRBAEB..."];
+          description = "Veilid peer route blobs (base64 URL-safe, no padding) to connect to on startup.";
+        };
+
+        dataDir = lib.mkOption {
+          type = lib.types.nullOr lib.types.path;
+          default = null;
+          description = ''
+            Directory for Veilid's table, protected and block stores.
+            Defaults to a `veilid` subdirectory of the server data directory.
+          '';
+        };
+
+        namespace = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = ''
+            Veilid namespace, isolating this node's Veilid storage from other
+            Veilid programs sharing the same data directory.
+          '';
+        };
+      };
+
       auth = lib.mkOption {
         type = lib.types.enum ["keyhive" "open"];
         default = "keyhive";
@@ -274,7 +311,11 @@ in {
       ++ lib.optionals (cfg.server.iroh.enable && cfg.server.iroh.directOnly) ["--iroh-direct-only"]
       ++ lib.optionals (cfg.server.iroh.relayUrl != null) ["--iroh-relay-url" cfg.server.iroh.relayUrl]
       ++ lib.concatMap (peer: ["--iroh-peer" peer]) cfg.server.iroh.peers
-      ++ lib.concatMap (addr: ["--iroh-peer-addr" addr]) cfg.server.iroh.peerAddrs;
+      ++ lib.concatMap (addr: ["--iroh-peer-addr" addr]) cfg.server.iroh.peerAddrs
+      ++ lib.optionals cfg.server.veilid.enable ["--veilid"]
+      ++ lib.optionals (cfg.server.veilid.enable && cfg.server.veilid.dataDir != null) ["--veilid-data-dir" (toString cfg.server.veilid.dataDir)]
+      ++ lib.optionals (cfg.server.veilid.enable && cfg.server.veilid.namespace != null) ["--veilid-namespace" cfg.server.veilid.namespace]
+      ++ lib.concatMap (peer: ["--veilid-peer" peer]) cfg.server.veilid.peers;
 
   in
     lib.mkIf anyEnabled {

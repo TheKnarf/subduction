@@ -23,7 +23,7 @@ block-beta
     Sync["Sync<br/>(Batch + Incremental)"]
     Connection["Connection<br/>(Typed Messages)"]
     Transport["Transport<br/>(Byte-oriented: Handshake · Policy)"]
-    Backend["Backend<br/>(WebSocket · HTTP Long-Poll · Iroh/QUIC)"]
+    Backend["Backend<br/>(WebSocket · HTTP Long-Poll · Iroh/QUIC · Veilid)"]
 ```
 
 ### Transport Stack

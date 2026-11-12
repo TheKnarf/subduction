@@ -1,14 +1,17 @@
 //! Unified transport enum for the CLI server.
 //!
 //! Wraps [`UnifiedWebSocket`], [`HttpLongPollTransport`], and
-//! [`IrohTransport`] so the server can use a single [`Subduction`]
-//! instance for all transport types.
+//! [`IrohTransport`], and (with the `veilid` feature) `VeilidTransport` so
+//! the server can use a single [`Subduction`] instance for all transport
+//! types.
 
 use future_form::Sendable;
 use futures::future::BoxFuture;
 use subduction_core::transport::Transport;
 use subduction_http_longpoll::transport::HttpLongPollTransport;
 use subduction_iroh::transport::IrohTransport;
+#[cfg(feature = "veilid")]
+use subduction_veilid::transport::VeilidTransport;
 use subduction_websocket::tokio::unified::UnifiedWebSocket;
 
 /// A unified connection covering all transport types the CLI server supports.
@@ -22,6 +25,10 @@ pub(crate) enum UnifiedTransport {
 
     /// Iroh QUIC transport.
     Iroh(IrohTransport),
+
+    /// Veilid private-route transport.
+    #[cfg(feature = "veilid")]
+    Veilid(VeilidTransport),
 }
 
 /// Error type for send operations across transports.
@@ -38,6 +45,11 @@ pub(crate) enum TransportSendError {
     /// Iroh send error.
     #[error(transparent)]
     Iroh(#[from] subduction_iroh::error::SendError),
+
+    /// Veilid send error.
+    #[cfg(feature = "veilid")]
+    #[error(transparent)]
+    Veilid(#[from] subduction_veilid::error::SendError),
 }
 
 /// Error type for recv operations across transports.
@@ -54,6 +66,11 @@ pub(crate) enum TransportRecvError {
     /// Iroh recv error.
     #[error(transparent)]
     Iroh(#[from] subduction_iroh::error::RecvError),
+
+    /// Veilid recv error.
+    #[cfg(feature = "veilid")]
+    #[error(transparent)]
+    Veilid(#[from] subduction_veilid::error::RecvError),
 }
 
 /// Error type for disconnect operations across transports.
@@ -70,6 +87,11 @@ pub(crate) enum TransportDisconnectionError {
     /// Iroh disconnection error.
     #[error(transparent)]
     Iroh(#[from] subduction_iroh::error::DisconnectionError),
+
+    /// Veilid disconnection error.
+    #[cfg(feature = "veilid")]
+    #[error(transparent)]
+    Veilid(#[from] subduction_veilid::error::DisconnectionError),
 }
 
 impl Transport<Sendable> for UnifiedTransport {
@@ -91,6 +113,11 @@ impl Transport<Sendable> for UnifiedTransport {
                 let fut = Transport::<Sendable>::send_bytes(iroh, bytes);
                 Box::pin(async move { fut.await.map_err(Into::into) })
             }
+            #[cfg(feature = "veilid")]
+            Self::Veilid(veilid) => {
+                let fut = Transport::<Sendable>::send_bytes(veilid, bytes);
+                Box::pin(async move { fut.await.map_err(Into::into) })
+            }
         }
     }
 
@@ -108,6 +135,12 @@ impl Transport<Sendable> for UnifiedTransport {
             }),
             Self::Iroh(iroh) => Box::pin(async {
                 Transport::<Sendable>::recv_bytes(iroh)
+                    .await
+                    .map_err(Into::into)
+            }),
+            #[cfg(feature = "veilid")]
+            Self::Veilid(veilid) => Box::pin(async {
+                Transport::<Sendable>::recv_bytes(veilid)
                     .await
                     .map_err(Into::into)
             }),
@@ -131,6 +164,12 @@ impl Transport<Sendable> for UnifiedTransport {
                     .await
                     .map_err(Into::into)
             }),
+            #[cfg(feature = "veilid")]
+            Self::Veilid(veilid) => Box::pin(async {
+                Transport::<Sendable>::disconnect(veilid)
+                    .await
+                    .map_err(Into::into)
+            }),
         }
     }
 }
@@ -141,6 +180,8 @@ impl PartialEq for UnifiedTransport {
             (Self::WebSocket(a), Self::WebSocket(b)) => a == b,
             (Self::HttpLongPoll(a), Self::HttpLongPoll(b)) => a == b,
             (Self::Iroh(a), Self::Iroh(b)) => a == b,
+            #[cfg(feature = "veilid")]
+            (Self::Veilid(a), Self::Veilid(b)) => a == b,
             _ => false,
         }
     }

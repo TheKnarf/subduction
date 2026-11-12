@@ -14,7 +14,7 @@
 
 - **Efficient Sync Protocol**: Uses [Sedimentree] for history sharding, diffing, and efficient incremental synchronization
 - **Encryption-Friendly**: Designed to work with encrypted data partitions without requiring decryption during sync
-- **No Central Server**: True peer-to-peer synchronization via pluggable transports (WebSocket, HTTP long-poll, Iroh/QUIC)
+- **No Central Server**: True peer-to-peer synchronization via pluggable transports (WebSocket, HTTP long-poll, Iroh/QUIC, Veilid)
 - **Multi-Platform**: Runs on native Rust, WebAssembly (browser & Node.js), and provides a CLI tool
 - **Automerge Integration**: While not the only data that can be synced via Subduction, [Automerge] was the original target.
 
@@ -42,6 +42,7 @@ graph TD
         subduction_http_longpoll
         subduction_hyper
         subduction_iroh
+        subduction_veilid
         subduction_websocket
     end
 
@@ -64,6 +65,7 @@ graph TD
     subduction_core --> sedimentree_fs_storage
     subduction_core --> subduction_http_longpoll
     subduction_core --> subduction_iroh
+    subduction_core --> subduction_veilid
     subduction_core --> subduction_websocket
     subduction_core --> subduction_keyhive_policy
     subduction_hyper -.->|hands over a WebSocketStream; not a dependency| subduction_websocket
@@ -77,6 +79,7 @@ graph TD
 
     subduction_http_longpoll --> subduction_cli
     subduction_iroh --> subduction_cli
+    subduction_veilid --> subduction_cli
     subduction_websocket --> subduction_cli
     sedimentree_fs_storage --> subduction_cli
 ```
@@ -90,6 +93,7 @@ graph TD
 | `subduction_http_longpoll` | HTTP long-poll transport for restricted network environments                           |
 | `subduction_hyper`         | WebSocket upgrades for servers built on hyper (axum, tower, raw hyper)                |
 | `subduction_iroh`          | Iroh (QUIC) transport for direct peer-to-peer connections                              |
+| [`subduction_veilid`](subduction_veilid/README.md) | Veilid transport over anonymous private routes (native only)       |
 | `subduction_websocket`     | WebSocket transport layer for peer-to-peer connections                                 |
 | [`subduction_tokio`](subduction_tokio/README.md) | Owned Tokio clients, erased transport connectors, and supervised reconnection |
 
@@ -255,6 +259,7 @@ subduction/
 ├── subduction_http_longpoll/   # HTTP long-poll transport
 ├── subduction_hyper/           # WebSocket upgrades for hyper servers
 ├── subduction_iroh/            # Iroh (QUIC) transport
+├── subduction_veilid/          # Veilid (private route) transport
 ├── subduction_websocket/       # WebSocket transport
 ├── subduction_wasm/            # Wasm bindings for Subduction
 ├── subduction_cli/             # CLI server and data management
@@ -273,7 +278,7 @@ The project uses several testing strategies:
 | Unit Tests           | Standard `cargo test` for Rust code                             |
 | Property-based Tests | [`bolero`] for fuzz testing                                     |
 | E2E Tests            | Playwright tests for Wasm bindings (see `subduction_wasm/e2e/`) |
-| Integration Tests    | Transport connection tests (WebSocket, HTTP long-poll, Iroh)   |
+| Integration Tests    | Transport connection tests (WebSocket, HTTP long-poll, Iroh, Veilid via its in-process mock network) |
 
 <!-- Internal Links -->
 

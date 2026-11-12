@@ -5,11 +5,12 @@
 
 ## Overview
 
-The Subduction CLI runs a document sync server with three transport layers:
+The Subduction CLI runs a document sync server with four transport layers:
 
 - **WebSocket** — browser-compatible, enabled by default
 - **HTTP Long Poll** — fallback for restrictive networks, enabled by default
 - **Iroh (QUIC)** — NAT-traversing P2P via [iroh](https://iroh.computer), opt-in
+- **Veilid** — anonymous P2P over [Veilid](https://veilid.com) private routes, opt-in (cargo feature `veilid`, enabled by default)
 
 ## Installation
 
@@ -140,6 +141,7 @@ subduction_cli server --socket 0.0.0.0:8080 --key-file ./key
 | `--websocket` | enabled | Enable the WebSocket transport |
 | `--longpoll` | enabled | Enable the HTTP long-poll transport |
 | `--iroh` | disabled | Enable the Iroh (QUIC) transport |
+| `--veilid` | disabled | Enable the Veilid transport (requires the `veilid` cargo feature) |
 
 At least one transport must be enabled.
 
@@ -160,6 +162,26 @@ At least one transport must be enabled.
 
 By default, iroh routes traffic through [iroh's public relay infrastructure](https://iroh.computer) for NAT traversal. Use `--iroh-direct-only` for LAN-only deployments, or `--iroh-relay-url` to point at a self-hosted [`iroh-relay`](https://docs.rs/iroh-relay) instance.
 
+#### Veilid Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--veilid-peer <ROUTE_BLOB>` | | Veilid peer route blob to connect to (base64 URL-safe, no padding; repeatable) |
+| `--veilid-data-dir <PATH>` | `<data-dir>/veilid` | Directory for Veilid's table, protected, and block stores |
+| `--veilid-namespace <NAME>` | | Veilid namespace, to isolate this node's Veilid storage from other Veilid programs |
+
+Veilid peers are addressed by **private route blobs**, not by public keys or socket addresses. On startup the server allocates a private route, logs it, and writes it to the ready file as `veilid_route=<base64>`. Give that value to peers as their `--veilid-peer`. A route can change: if Veilid reports the server's own route as dead, a new one is allocated and a warning is logged, and peers need the new blob.
+
+Veilid starts after the other transports: attaching to the network and allocating a private route can take minutes on a cold start, so the ready file is written only once Veilid is up. Ctrl+C during startup shuts the half-started node down cleanly; any other Veilid startup failure stops the server. A binary built with `--all-targets` or by `cargo test --workspace` may be linked against veilid-core's in-process mock network (Cargo feature unification); the server detects this and refuses `--veilid`, so build release binaries with `cargo build -p subduction_cli`.
+
+Veilid connections are anonymous at the transport layer. The Subduction handshake is the only peer authentication, exactly as with other transports. Veilid caps each message at 32 KiB, so larger sync messages are split into acknowledged fragments. Throughput is much lower than WebSocket or Iroh, and Veilid suits privacy-sensitive deployments better than bulk sync. See the [`subduction_veilid` README](../subduction_veilid/README.md) for the protocol details.
+
+To build without Veilid (and without the `veilid-core` dependency):
+
+```bash
+cargo build -p subduction_cli --no-default-features --features native-tls,os-metrics
+```
+
 #### Metrics Options
 
 | Flag | Default | Description |
@@ -172,7 +194,7 @@ By default, iroh routes traffic through [iroh's public relay infrastructure](htt
 
 | Flag | Description |
 |------|-------------|
-| `--ready-file <PATH>` | Write a file on startup with assigned port, peer ID, and iroh node ID |
+| `--ready-file <PATH>` | Write a file on startup with the assigned port, peer ID, iroh node ID (`iroh_node_id`, `iroh_addrs`), and Veilid route blob (`veilid_route`) |
 
 ### `purge`
 
@@ -209,6 +231,14 @@ subduction_cli server --key-file ./key --iroh \
 # Iroh direct only (LAN, no relay)
 subduction_cli server --key-file ./key --iroh --iroh-direct-only \
   --iroh-peer <node-id> --iroh-peer-addr 192.168.1.50:12345
+
+# Veilid (anonymous private routes); read our route blob from the ready file
+subduction_cli server --key-file ./key1 --veilid --ready-file ./ready1
+grep veilid_route ./ready1   # veilid_route=<base64 route blob>
+
+# Second node connecting to the first over Veilid
+subduction_cli server --key-file ./key2 --data-dir ./data2 --veilid \
+  --veilid-peer <base64 route blob of node 1>
 
 # Discovery mode (clients connect by service name instead of peer ID)
 subduction_cli server --key-file ./key --service-name sync.example.com
@@ -257,6 +287,14 @@ The flake provides NixOS and Home Manager modules for running Subduction as a ma
                 peers = ["<remote-node-id>"];
                 # directOnly = true;      # LAN only, no relay
                 # relayUrl = "https://..."; # self-hosted relay
+              };
+
+              # Veilid transport (anonymous private routes)
+              veilid = {
+                enable = true;
+                peers = ["<base64 route blob>"];
+                # dataDir = "/var/lib/subduction/veilid"; # default
+                # namespace = "subduction";
               };
 
               # Prometheus metrics

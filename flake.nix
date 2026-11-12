@@ -215,7 +215,7 @@
                 Subduction is a peer-to-peer synchronization protocol built on top of
                 Sedimentree, providing efficient data synchronization with support for
                 multiple transports. This CLI runs a Subduction sync server supporting
-                WebSocket, HTTP long-poll, and Iroh (QUIC) transports.
+                WebSocket, HTTP long-poll, Iroh (QUIC), and Veilid transports.
               '';
               homepage = "https://github.com/inkandswitch/subduction";
               license = [

@@ -1,0 +1,60 @@
+[package]
+name = "subduction_veilid"
+version = "0.1.0"
+description = "Veilid (private route) transport layer for the Subduction sync protocol"
+
+categories = ["network-programming"]
+keywords = ["veilid", "p2p", "privacy", "sync", "subduction"]
+readme = "./README.md"
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-channel = { workspace = true }
+async-lock = { workspace = true }
+futures = { workspace = true }
+future_form = { workspace = true }
+rand = { workspace = true, features = ["getrandom"] }
+subduction_core = { workspace = true, features = ["system_time"] }
+subduction_crypto = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }
+tracing = { workspace = true }
+veilid-core = { workspace = true }
+
+[dev-dependencies]
+futures-timer = { workspace = true }
+rand = { workspace = true, features = ["std_rng"] }
+sedimentree_core = { workspace = true, features = ["arbitrary", "serde", "std"] }
+subduction_core = { workspace = true, features = ["test_utils"] }
+subduction_crypto = { workspace = true }
+subduction_websocket = { workspace = true, features = ["futures-timer"] }
+testresult = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "std"] }
+# Integration tests run against veilid-core's in-process simulated network.
+# NOTE: Cargo unifies features, so any build that compiles this crate's dev
+# targets (e.g. `cargo test -p subduction_veilid`, `cargo test --workspace`)
+# also links the mock into the library. See README "Testing".
+veilid-core = { workspace = true, features = ["mock-api"] }
+
+[features]
+default = ["server"]
+
+## Enable the server-side accept helper (`server::accept_one`).
+server = []
+
+## Replace the real Veilid network with veilid-core's in-process mock
+## network. For tests of downstream crates only; never enable in production.
+mock-api = ["veilid-core/mock-api"]
+
+[[test]]
+name = "round_trip"
+required-features = ["server"]
+
+[lints]
+workspace = true

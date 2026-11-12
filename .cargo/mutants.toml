@@ -110,3 +110,4 @@ minimum_test_timeout = 60
 #   cargo mutants -p subduction_crypto --features arbitrary
 #   cargo mutants -p sedimentree_core --features arbitrary
 #   cargo mutants -p subduction_iroh             # no extra features
+#   cargo mutants -p subduction_veilid           # no extra features (tests use veilid-core's mock-api)

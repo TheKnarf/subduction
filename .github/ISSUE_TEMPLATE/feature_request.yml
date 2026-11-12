@@ -38,6 +38,7 @@ body:
         - label: subduction_iroh
         - label: subduction_keyhive
         - label: subduction_keyhive_policy
+        - label: subduction_veilid
         - label: subduction_wasm
         - label: subduction_websocket
         - label: New crate

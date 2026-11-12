@@ -122,6 +122,7 @@ jobs:
             [subduction_hyper]="axum"
             [subduction_iroh]=""
             [subduction_keyhive]=""
+            [subduction_veilid]=""
             [subduction_websocket]=""
           )
 
@@ -231,6 +232,8 @@ jobs:
           - crate: subduction_iroh
             features: ""
           - crate: subduction_keyhive
+            features: ""
+          - crate: subduction_veilid
             features: ""
           - crate: subduction_websocket
             features: ""

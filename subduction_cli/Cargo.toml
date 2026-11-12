@@ -1,7 +1,7 @@
 [package]
 name = "subduction_cli"
 version = "0.22.0"
-description = "CLI server for Subduction sync over WebSocket, HTTP long-poll, and Iroh (QUIC)"
+description = "CLI server for Subduction sync over WebSocket, HTTP long-poll, Iroh (QUIC), and Veilid"
 
 categories = ["command-line-utilities", "web-programming"]
 keywords = ["subduction"]
@@ -18,6 +18,7 @@ ahash = { workspace = true }
 async-channel = { workspace = true }
 async-lock = { workspace = true }
 async-tungstenite = { workspace = true }
+base64 = { workspace = true, optional = true }
 axum = { workspace = true }
 ciborium = { workspace = true }
 clap = { workspace = true }
@@ -56,6 +57,7 @@ subduction_http_longpoll = { workspace = true, features = [
   "std",
 ] }
 subduction_iroh = { workspace = true }
+subduction_veilid = { workspace = true, optional = true }
 subduction_websocket = { workspace = true, features = ["metrics"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing"] }
@@ -91,7 +93,7 @@ tokio = { workspace = true, features = ["full"] }
 nix = { workspace = true, optional = true }
 
 [features]
-default = ["native-tls", "os-metrics"]
+default = ["native-tls", "os-metrics", "veilid"]
 # Host-level metrics: process memory/CPU/FDs (metrics-process) and disk usage
 # (nix statvfs). Optional so the binary can drop those deps; on by default.
 os-metrics = ["dep:metrics-process", "dep:nix"]
@@ -110,6 +112,9 @@ rustls = [
   "subduction_websocket/tokio_client_rustls",
   "subduction_websocket/tokio_server_rustls",
 ]
+# Veilid (private route) transport: `--veilid` and related flags. On by
+# default; disable to drop the (large) veilid-core dependency tree.
+veilid = ["dep:base64", "dep:subduction_veilid"]
 # Compile in `console-subscriber`. Off by default; set `TOKIO_CONSOLE=1` at
 # runtime when built with this feature to attach `tokio-console`.
 tokio-console = ["dep:console-subscriber"]

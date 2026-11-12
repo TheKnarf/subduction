@@ -312,6 +312,7 @@ All transports enforce a maximum message size (default **50 MiB**). Messages exc
 - WebSocket: `DEFAULT_MAX_MESSAGE_SIZE` (50 MiB)
 - HTTP long-poll: `DEFAULT_MAX_BODY_SIZE` (50 MiB)
 - Iroh/QUIC: `MAX_FRAME_SIZE` (50 MiB, enforced in length-prefix framing)
+- Veilid: `MAX_MESSAGE_SIZE` (50 MiB, configurable via `EndpointConfig::max_message_size`, enforced on reassembly). Veilid caps each app call at 32 KiB, so `subduction_veilid` splits every message into frames of at most `MAX_APP_FRAME_SIZE` (32 768 bytes, header included) and rejects a message whose declared fragment count would exceed the cap before allocating any reassembly buffer
 
 ## Signed Payload Formats
 
