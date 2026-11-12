@@ -15,8 +15,9 @@ use std::{
 };
 
 use subduction_veilid::{
-    endpoint::{EndpointConfig, VeilidEndpoint},
-    veilid_core::VeilidConfig,
+    endpoint::{EndpointConfig, VeilidDispatcher, VeilidEndpoint},
+    session::Session,
+    veilid_core::{RouteId, VeilidConfig, VeilidRouteChange, VeilidUpdate},
 };
 
 /// Generous upper bound for any single step of a test.
@@ -94,4 +95,66 @@ pub fn payload(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
         .map(|i| u8::try_from(i % 251).expect("< 251") ^ seed)
         .collect()
+}
+
+/// An endpoint bound (in "bring your own node" mode) to a Veilid node whose
+/// updates go through `dispatcher`, so tests can inject synthetic updates
+/// such as route changes.
+pub struct BoundEndpoint {
+    pub endpoint: VeilidEndpoint,
+    pub dispatcher: VeilidDispatcher,
+}
+
+impl BoundEndpoint {
+    pub async fn start(config: EndpointConfig) -> Self {
+        let dispatcher = VeilidDispatcher::new();
+        let api = subduction_veilid::veilid_core::api_startup(
+            dispatcher.update_callback(None),
+            unique_veilid_config(),
+        )
+        .await
+        .expect("start veilid node");
+        api.attach().await.expect("attach");
+        let endpoint = VeilidEndpoint::bind(api, &dispatcher, config)
+            .await
+            .expect("bind endpoint");
+        Self {
+            endpoint,
+            dispatcher,
+        }
+    }
+
+    /// Inject a `RouteChange` as Veilid would deliver it.
+    pub fn route_change(&self, dead_routes: Vec<RouteId>, dead_remote_routes: Vec<RouteId>) {
+        let change = VeilidRouteChange {
+            dead_routes,
+            dead_remote_routes,
+        };
+        let _passed_on = self
+            .dispatcher
+            .handle_update(VeilidUpdate::RouteChange(Box::new(change)));
+    }
+
+    /// Shut the endpoint and its Veilid node down.
+    pub async fn shutdown(&self) {
+        self.endpoint.shutdown().await;
+        self.endpoint.api().clone().shutdown().await;
+    }
+}
+
+/// Open a session from `client` to `server`, accept it, and mark both ends
+/// established (as the handshake would).
+pub async fn pair(client: &VeilidEndpoint, server: &VeilidEndpoint) -> (Session, Session) {
+    let blob = server.route_blob();
+    let (opened, accepted) = step("open + accept", async {
+        tokio::join!(client.open_session(&blob), server.accept())
+    })
+    .await;
+    let (c, s) = (
+        opened.expect("open session"),
+        accepted.expect("accept session"),
+    );
+    c.mark_established();
+    s.mark_established();
+    (c, s)
 }

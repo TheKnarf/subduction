@@ -128,6 +128,11 @@ pub enum ConnectError {
     #[error("invalid remote route blob: {0}")]
     InvalidRoute(VeilidAPIError),
 
+    /// The peer's [`VeilidAddress`](crate::address::VeilidAddress) could not
+    /// be resolved to a route blob.
+    #[error("cannot resolve peer address: {0}")]
+    Resolve(#[from] crate::address::ResolveError),
+
     /// Opening the session failed.
     #[error("failed to open session: {0}")]
     Open(#[from] StreamError),

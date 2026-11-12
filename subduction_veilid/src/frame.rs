@@ -12,6 +12,7 @@
 //! DATA  (kind 2): header | seq: u64 BE | frag_idx: u32 BE | frag_count: u32 BE | chunk
 //! CLOSE (kind 3): header | code: u32 BE | reason (UTF-8, <= 123 bytes)
 //! PING  (kind 4): header   (keepalive probe: ACK if the session exists)
+//! ROUTE_UPDATE (kind 5): header | generation: u64 BE | sender's new route blob
 //!
 //! reply (2 bytes):
 //!   version: u8 | status: u8   (0 = ACK, otherwise a NACK reason)
@@ -56,6 +57,7 @@ const KIND_OPEN: u8 = 1;
 const KIND_DATA: u8 = 2;
 const KIND_CLOSE: u8 = 3;
 const KIND_PING: u8 = 4;
+const KIND_ROUTE_UPDATE: u8 = 5;
 
 const STATUS_ACK: u8 = 0;
 const STATUS_UNKNOWN_SESSION: u8 = 1;
@@ -65,10 +67,14 @@ const STATUS_TOO_LARGE: u8 = 4;
 
 /// Identifier of one session, chosen at random by the initiator.
 ///
-/// The id only demultiplexes frames arriving on the endpoint's single private
-/// route. It is unguessable and kept confidential by Veilid's end-to-end
-/// encryption, but it is **not** a credential: peer identity is established
-/// exclusively by the Subduction handshake.
+/// The id demultiplexes frames arriving on the endpoint's single private
+/// route. It does **not** establish peer identity (only the Subduction
+/// handshake does), but it is effectively a _bearer secret_ for the session:
+/// whoever knows it can send frames into the session, including a
+/// `ROUTE_UPDATE` that redirects the session's replies to another route. It is
+/// 128 random bits and only ever travels inside Veilid's end-to-end
+/// encrypted private routes, so off-path attackers cannot learn or guess it;
+/// never log or expose it outside debugging.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId([u8; SESSION_ID_LEN]);
 
@@ -146,6 +152,15 @@ pub(crate) enum Frame {
 
     /// Keepalive probe: answered with ACK while the session exists.
     Ping { session_id: SessionId },
+
+    /// The sender's private route changed: send to `route_blob` from now
+    /// on. `generation` increases with every reallocation, so a delayed
+    /// retransmit of an older update is ignored.
+    RouteUpdate {
+        session_id: SessionId,
+        generation: u64,
+        route_blob: Vec<u8>,
+    },
 }
 
 impl Frame {
@@ -155,7 +170,8 @@ impl Frame {
             Self::Open { session_id, .. }
             | Self::Data { session_id, .. }
             | Self::Close { session_id, .. }
-            | Self::Ping { session_id } => *session_id,
+            | Self::Ping { session_id }
+            | Self::RouteUpdate { session_id, .. } => *session_id,
         }
     }
 
@@ -221,6 +237,18 @@ impl Frame {
                 })
             }
             KIND_PING => Ok(Self::Ping { session_id }),
+            KIND_ROUTE_UPDATE => {
+                let (generation, blob) =
+                    body.split_first_chunk::<8>().ok_or(FrameError::Truncated)?;
+                if blob.is_empty() {
+                    return Err(FrameError::Truncated);
+                }
+                Ok(Self::RouteUpdate {
+                    session_id,
+                    generation: u64::from_be_bytes(*generation),
+                    route_blob: blob.to_vec(),
+                })
+            }
             other => Err(FrameError::UnknownKind(other)),
         }
     }
@@ -296,6 +324,28 @@ pub(crate) fn encode_close(session_id: SessionId, code: u32, reason: &str) -> Ve
 /// Encode a PING (keepalive) frame.
 pub(crate) fn encode_ping(session_id: SessionId) -> Vec<u8> {
     header(KIND_PING, session_id, HEADER_LEN)
+}
+
+/// Encode a `ROUTE_UPDATE` frame.
+pub(crate) fn encode_route_update(
+    session_id: SessionId,
+    generation: u64,
+    route_blob: &[u8],
+) -> Result<Vec<u8>, FrameError> {
+    let len = HEADER_LEN + 8 + route_blob.len();
+    if len > MAX_APP_FRAME_SIZE {
+        return Err(FrameError::TooLarge {
+            actual: len,
+            max: MAX_APP_FRAME_SIZE,
+        });
+    }
+    if route_blob.is_empty() {
+        return Err(FrameError::Truncated);
+    }
+    let mut out = header(KIND_ROUTE_UPDATE, session_id, len);
+    out.extend_from_slice(&generation.to_be_bytes());
+    out.extend_from_slice(route_blob);
+    Ok(out)
 }
 
 /// Why a frame was refused by the receiver.
@@ -511,6 +561,37 @@ mod tests {
         assert_eq!(
             Frame::decode(&bytes).unwrap(),
             Frame::Ping { session_id: sid() }
+        );
+    }
+
+    #[test]
+    fn route_update_round_trip() {
+        let bytes = encode_route_update(sid(), 7, b"new-blob").unwrap();
+        assert_eq!(bytes.len(), HEADER_LEN + 8 + 8);
+        let frame = Frame::decode(&bytes).unwrap();
+        assert_eq!(
+            frame,
+            Frame::RouteUpdate {
+                session_id: sid(),
+                generation: 7,
+                route_blob: b"new-blob".to_vec()
+            }
+        );
+        assert_eq!(frame.session_id(), sid());
+
+        assert_eq!(
+            encode_route_update(sid(), 1, b""),
+            Err(FrameError::Truncated)
+        );
+        assert!(matches!(
+            encode_route_update(sid(), 1, &vec![0u8; MAX_APP_FRAME_SIZE]),
+            Err(FrameError::TooLarge { .. })
+        ));
+        // Generation present but no blob.
+        let bytes = encode_route_update(sid(), 1, b"x").unwrap();
+        assert_eq!(
+            Frame::decode(&bytes[..bytes.len() - 1]),
+            Err(FrameError::Truncated)
         );
     }
 

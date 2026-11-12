@@ -72,18 +72,43 @@ pub struct CloseInfo {
 /// An inbound frame waiting for the pump, with the app call to answer.
 pub(crate) type QueuedFrame = (OperationId, Frame);
 
+/// The peer's private route as seen by one session.
+#[derive(Debug)]
+pub(crate) struct RemoteRoute {
+    /// The imported route frames are sent to; `None` while the route is
+    /// _lost_ (Veilid reported it dead, or sends to it kept failing, and
+    /// re-importing the blob did not help): senders wait for a `ROUTE_UPDATE`
+    /// for up to
+    /// [`route_recovery_timeout`](crate::endpoint::EndpointConfig::route_recovery_timeout).
+    pub(crate) id: Option<RouteId>,
+    /// The latest route blob of the peer (from OPEN, the address we dialled,
+    /// or the latest `ROUTE_UPDATE`); re-imported when the route dies.
+    pub(crate) blob: Vec<u8>,
+    /// Generation of the latest `ROUTE_UPDATE` applied (0: none yet).
+    pub(crate) generation: u64,
+    /// Incremented on every change of `id`: a route installed (including a
+    /// re-import of the same blob, which yields the same `RouteId`) or lost.
+    /// Lets senders tell a fresh route from the one that failed them, and a
+    /// recovery deadline close the session only if it is still the same
+    /// loss.
+    pub(crate) epoch: u64,
+}
+
 /// State shared between the endpoint's session table, the pump, and the
 /// user-facing [`Session`] handle.
 #[derive(Debug)]
 pub(crate) struct SessionShared {
     pub(crate) id: SessionId,
 
-    /// Imported remote private route used to reach the peer.
-    pub(crate) remote_route: RouteId,
+    /// How to reach the peer. Lock order: endpoint state, then this.
+    pub(crate) remote: Mutex<RemoteRoute>,
 
-    /// The peer's route blob, kept on the responder side to recognise a
-    /// retransmitted OPEN.
-    pub(crate) remote_blob: Option<Vec<u8>>,
+    /// Woken when `remote.id` changes or the session closes.
+    pub(crate) route_changed: tokio::sync::Notify,
+
+    /// The blob the peer's OPEN carried (responder side only), to recognise
+    /// a retransmitted OPEN.
+    pub(crate) open_blob: Option<Vec<u8>>,
 
     /// Whether we opened this session.
     pub(crate) initiator: bool,
@@ -109,16 +134,23 @@ impl SessionShared {
     pub(crate) fn new(
         id: SessionId,
         remote_route: RouteId,
-        remote_blob: Option<Vec<u8>>,
+        remote_blob: Vec<u8>,
         initiator: bool,
         inbound_capacity: usize,
     ) -> (Arc<Self>, async_channel::Receiver<QueuedFrame>) {
         let (inbound_tx, inbound_rx) = async_channel::bounded(inbound_capacity.max(1));
         let (frames_tx, frames_rx) = async_channel::bounded(FRAME_QUEUE_CAPACITY);
+        let open_blob = (!initiator).then(|| remote_blob.clone());
         let shared = Arc::new(Self {
             id,
-            remote_route,
-            remote_blob,
+            remote: Mutex::new(RemoteRoute {
+                id: Some(remote_route),
+                blob: remote_blob,
+                generation: 0,
+                epoch: 0,
+            }),
+            route_changed: tokio::sync::Notify::new(),
+            open_blob,
             initiator,
             inbound_tx,
             inbound_rx,
@@ -128,6 +160,23 @@ impl SessionShared {
             close: Mutex::new(None),
         });
         (shared, frames_rx)
+    }
+
+    /// The imported route currently used to reach the peer (`None` while
+    /// the route is lost).
+    pub(crate) fn current_route(&self) -> Option<RouteId> {
+        lock(&self.remote).id.clone()
+    }
+
+    /// The current route and its epoch (`None` while the route is lost).
+    pub(crate) fn current_route_epoch(&self) -> Option<(RouteId, u64)> {
+        let remote = lock(&self.remote);
+        remote.id.clone().map(|id| (id, remote.epoch))
+    }
+
+    /// The peer's latest route blob.
+    pub(crate) fn remote_blob(&self) -> Vec<u8> {
+        lock(&self.remote).blob.clone()
     }
 
     /// Record the close (first caller wins) and close the channels.
@@ -147,6 +196,8 @@ impl SessionShared {
         }
         self.inbound_tx.close();
         self.frames_tx.close();
+        // Wake senders waiting for a lost route to come back.
+        self.route_changed.notify_waiters();
         true
     }
 
@@ -271,7 +322,9 @@ pub(crate) async fn pump(
                 // Pings are answered by the dispatcher; handled here for
                 // completeness.
                 Frame::Ping { .. } => Reply::Ack,
-                Frame::Open { .. } => Reply::Nack(NackReason::Protocol),
+                // OPEN never targets an existing session's pump; ROUTE_UPDATE
+                // is handled by the dispatcher.
+                Frame::Open { .. } | Frame::RouteUpdate { .. } => Reply::Nack(NackReason::Protocol),
             }
         };
 
@@ -338,7 +391,9 @@ pub(crate) async fn keepalive(
             break;
         }
         let ping = encode_ping(shared.id);
-        if let Err(e) = ep.call(&shared.remote_route, &ping, Some(&shared)).await {
+        // While the peer's route is lost this waits for it to come back (or
+        // for the recovery deadline to close the session) instead of failing.
+        if let Err(e) = ep.call_session(&shared, &ping).await {
             if let Some((code, notify)) = failure_close(&e) {
                 tracing::info!(session = %shared.id, error = %e, "veilid: keepalive failed; closing session");
                 ep.close_session(&shared, code, &e.to_string(), notify);
@@ -432,6 +487,23 @@ impl Session {
         self.inner.shared.initiator
     }
 
+    /// The imported Veilid route currently used to reach the peer, or `None`
+    /// while that route is lost and the session is waiting for the peer's
+    /// `ROUTE_UPDATE` (see the crate README, "Route changes").
+    #[must_use]
+    pub fn remote_route_id(&self) -> Option<RouteId> {
+        self.inner.shared.current_route()
+    }
+
+    /// Whether the peer's route is currently lost (the session is waiting,
+    /// for up to
+    /// [`route_recovery_timeout`](crate::endpoint::EndpointConfig::route_recovery_timeout),
+    /// for the peer to announce a new one).
+    #[must_use]
+    pub fn is_route_lost(&self) -> bool {
+        !self.is_closed() && self.remote_route_id().is_none()
+    }
+
     /// The close code and reason, once the session is closed.
     #[must_use]
     pub fn close_info(&self) -> Option<CloseInfo> {
@@ -471,6 +543,10 @@ impl Session {
     /// with bounded exponential backoff; a busy receiver (backpressure) is
     /// waited for up to
     /// [`max_busy_wait`](crate::endpoint::EndpointConfig::max_busy_wait).
+    /// If the peer's route fails or is reported dead, the route is
+    /// re-imported, and if that does not help the send waits (for up to
+    /// [`route_recovery_timeout`](crate::endpoint::EndpointConfig::route_recovery_timeout))
+    /// for the peer to announce a new route.
     ///
     /// # Errors
     ///
@@ -500,11 +576,7 @@ impl Session {
 
         for (idx, chunk) in (0u32..).zip(frags) {
             let result = match encode_data(h.shared.id, *seq, idx, count, chunk) {
-                Ok(frame) => {
-                    h.endpoint
-                        .call(&h.shared.remote_route, &frame, Some(&h.shared))
-                        .await
-                }
+                Ok(frame) => h.endpoint.call_session(&h.shared, &frame).await,
                 Err(e) => Err(e.into()),
             };
             if let Err(e) = result {

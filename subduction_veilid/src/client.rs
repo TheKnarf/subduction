@@ -1,7 +1,8 @@
 //! Client-side connection establishment for the Veilid transport.
 //!
-//! Connects to a remote peer by its private route blob and returns an
-//! [`Authenticated`] connection with background listener and sender tasks.
+//! Connects to a remote peer by its [`VeilidAddress`] (stable DHT address or
+//! raw private route blob) and returns an [`Authenticated`] connection with
+//! background listener and sender tasks.
 
 use future_form::Sendable;
 use futures::future::BoxFuture;
@@ -13,6 +14,7 @@ use subduction_core::{
 use subduction_crypto::{nonce::Nonce, signer::Signer};
 
 use crate::{
+    address::VeilidAddress,
     endpoint::VeilidEndpoint,
     error::{ConnectError, RunError},
     handshake::VeilidHandshake,
@@ -77,7 +79,51 @@ where
     S: Signer<Sendable>,
 {
     let session = endpoint.open_session(remote_route_blob).await?;
+    handshake_over(endpoint, session, signer, audience).await
+}
 
+/// Connect to a remote peer by [`VeilidAddress`].
+///
+/// A DHT address is resolved to the peer's _current_ route blob on every
+/// call (with a forced network refresh), so redialling a peer by its stable
+/// address keeps working after it reallocates its route or restarts. A
+/// route blob address behaves like [`connect`].
+///
+/// # Errors
+///
+/// [`ConnectError::Resolve`] if the address cannot be resolved (e.g.
+/// `TryAgain` while our node is still attaching, or the peer has not
+/// published yet), otherwise as [`connect`].
+///
+/// # Example
+///
+/// ```ignore
+/// let address: VeilidAddress = "VLD0:...".parse()?;
+/// let result = connect_address(&endpoint, &address, &signer, Audience::known(peer_id)).await?;
+/// ```
+pub async fn connect_address<S>(
+    endpoint: &VeilidEndpoint,
+    address: &VeilidAddress,
+    signer: &S,
+    audience: Audience,
+) -> Result<ConnectResult, ConnectError>
+where
+    S: Signer<Sendable>,
+{
+    let session = endpoint.open_session_to(address).await?;
+    handshake_over(endpoint, session, signer, audience).await
+}
+
+/// Run the initiator's handshake over a freshly opened session.
+async fn handshake_over<S>(
+    endpoint: &VeilidEndpoint,
+    session: crate::session::Session,
+    signer: &S,
+    audience: Audience,
+) -> Result<ConnectResult, ConnectError>
+where
+    S: Signer<Sendable>,
+{
     tracing::info!(session = %session.id(), "veilid: session opened, starting handshake");
 
     let now = TimestampSeconds::now();

@@ -38,19 +38,25 @@
 //! Session::recv --> [listener task] --> inbound_writer --> recv()
 //! ```
 //!
-//! See the crate README for the session wire protocol.
+//! Sessions survive route churn: a dead peer route is re-imported, a dead own
+//! route is reallocated and announced to peers (`ROUTE_UPDATE`), and the
+//! endpoint publishes its current route under a stable DHT
+//! [`address`](address::VeilidAddress). See the crate README for the session
+//! wire protocol and the route-change rules.
 //!
 //! # Example
 //!
 //! ```ignore
-//! use subduction_veilid::{client, endpoint::{EndpointConfig, VeilidEndpoint, node_config}};
+//! use subduction_veilid::{client, VeilidAddress, endpoint::{EndpointConfig, VeilidEndpoint, node_config}};
 //! use subduction_core::handshake::audience::Audience;
 //!
 //! let config = node_config("subduction", "", &data_dir);
 //! let endpoint = VeilidEndpoint::start(config, EndpointConfig::default(), None).await?;
-//! println!("our route blob: {:?}", endpoint.route_blob());
+//! // Stable across route changes and restarts:
+//! println!("our address: {}", endpoint.wait_address_published().await.unwrap());
 //!
-//! let result = client::connect(&endpoint, &peer_route_blob, &signer, Audience::known(peer_id)).await?;
+//! let peer: VeilidAddress = peer_address_string.parse()?;
+//! let result = client::connect_address(&endpoint, &peer, &signer, Audience::known(peer_id)).await?;
 //! tokio::spawn(result.listener_task);
 //! tokio::spawn(result.sender_task);
 //! subduction.add_connection(result.authenticated).await?;
@@ -60,7 +66,9 @@
 
 extern crate alloc;
 
+pub mod address;
 pub mod client;
+pub mod data_dir;
 pub mod endpoint;
 pub mod error;
 pub mod frame;
@@ -74,6 +82,7 @@ mod reassembly;
 #[cfg(feature = "server")]
 pub mod server;
 
+pub use address::VeilidAddress;
 pub use reassembly::ReassemblyError;
 
 /// Re-export of the `veilid-core` version this crate is built against.

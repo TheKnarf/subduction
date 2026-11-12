@@ -18,7 +18,6 @@ ahash = { workspace = true }
 async-channel = { workspace = true }
 async-lock = { workspace = true }
 async-tungstenite = { workspace = true }
-base64 = { workspace = true, optional = true }
 axum = { workspace = true }
 ciborium = { workspace = true }
 clap = { workspace = true }
@@ -114,7 +113,7 @@ rustls = [
 ]
 # Veilid (private route) transport: `--veilid` and related flags. On by
 # default; disable to drop the (large) veilid-core dependency tree.
-veilid = ["dep:base64", "dep:subduction_veilid"]
+veilid = ["dep:subduction_veilid"]
 # Compile in `console-subscriber`. Off by default; set `TOKIO_CONSOLE=1` at
 # runtime when built with this feature to attach `tokio-console`.
 tokio-console = ["dep:console-subscriber"]

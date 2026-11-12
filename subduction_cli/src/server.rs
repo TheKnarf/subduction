@@ -221,16 +221,21 @@ pub(crate) struct ServerArgs {
     /// Enable the Veilid transport (anonymous P2P over Veilid private routes).
     /// Started after the other transports; the ready file is written once
     /// Veilid has attached and allocated a private route (can take minutes on
-    /// a cold start). A Veilid startup failure stops the server.
+    /// a cold start) and has published its stable address (waits at most 2
+    /// more minutes). A Veilid startup failure stops the server.
     #[cfg(feature = "veilid")]
     #[arg(long, default_value_t = false)]
     pub(crate) veilid: bool,
 
-    /// Veilid peer route blobs to connect to on startup (URL-safe base64,
-    /// no padding; printed by the peer at startup and in its ready file)
+    /// Veilid peers to keep connected to (repeatable): a peer's stable DHT
+    /// address (`VLD0:...`, its `veilid_address`) or, for backward
+    /// compatibility, a raw route blob (URL-safe base64, its `veilid_route`;
+    /// stops working once the peer's route changes). Each peer is redialed
+    /// with exponential backoff (1 s up to 60 s) whenever the connection
+    /// drops or a dial fails; a DHT address is resolved afresh on every dial
     #[cfg(feature = "veilid")]
-    #[arg(long = "veilid-peer", value_name = "ROUTE_BLOB")]
-    pub(crate) veilid_peers: Vec<String>,
+    #[arg(long = "veilid-peer", value_name = "ADDRESS")]
+    pub(crate) veilid_peers: Vec<subduction_veilid::VeilidAddress>,
 
     /// Directory for Veilid's table, protected, and block stores
     /// [default: a `veilid` subdirectory of the data directory]
@@ -245,7 +250,7 @@ pub(crate) struct ServerArgs {
     pub(crate) veilid_namespace: Option<String>,
 
     /// Write a file on startup with the assigned port, peer ID, iroh node ID, and
-    /// Veilid route blob (`key=value` lines).
+    /// Veilid stable address and current route blob (`key=value` lines).
     /// Useful for integration tests that need to discover the server's address.
     #[arg(long = "ready-file", value_name = "PATH")]
     pub(crate) ready_file: Option<PathBuf>,
@@ -1054,9 +1059,13 @@ where
             format!("iroh_addrs={}\n", addrs.join(","))
         };
         #[cfg(feature = "veilid")]
-        let veilid_line = veilid
-            .as_ref()
-            .map_or(String::new(), |v| format!("veilid_route={}\n", v.route));
+        let veilid_line = veilid.as_ref().map_or(String::new(), |v| {
+            let address = v
+                .address
+                .as_ref()
+                .map_or(String::new(), |a| format!("veilid_address={a}\n"));
+            format!("{address}veilid_route={}\n", v.route)
+        });
         #[cfg(not(feature = "veilid"))]
         let veilid_line = String::new();
         let content = format!(
@@ -1681,40 +1690,67 @@ const VEILID_DIR: &str = "veilid";
 #[cfg(feature = "veilid")]
 const VEILID_PROGRAM_NAME: &str = "subduction";
 
-/// A running Veilid transport: the endpoint, its accept loop, and the
-/// (base64) route blob peers use to reach us.
+/// How long startup waits for our stable DHT address to be published before
+/// writing the ready file without it (it is still logged once published).
+#[cfg(feature = "veilid")]
+const VEILID_ADDRESS_WAIT: Duration = Duration::from_secs(120);
+
+/// First redial delay of a `--veilid-peer` supervisor.
+#[cfg(feature = "veilid")]
+const VEILID_REDIAL_MIN: Duration = Duration::from_secs(1);
+
+/// Upper bound of the (doubling) redial delay.
+#[cfg(feature = "veilid")]
+const VEILID_REDIAL_MAX: Duration = Duration::from_secs(60);
+
+/// A connection that lived at least this long resets the redial delay.
+#[cfg(feature = "veilid")]
+const VEILID_STABLE_CONNECTION: Duration = Duration::from_secs(60);
+
+/// A running Veilid transport: the endpoint, its accept loop, our current
+/// route blob, and our stable DHT address (if published in time).
 #[cfg(feature = "veilid")]
 struct VeilidRuntime {
     endpoint: subduction_veilid::endpoint::VeilidEndpoint,
     accept_task: tokio::task::JoinHandle<()>,
-    route: String,
+    route: subduction_veilid::VeilidAddress,
+    address: Option<subduction_veilid::VeilidAddress>,
 }
 
-/// Encode a Veilid route blob for display, flags, and the ready file.
+/// Redial backoff of a peer supervisor: starts at [`VEILID_REDIAL_MIN`] and
+/// doubles after every wait, capped at [`VEILID_REDIAL_MAX`]; a connection
+/// that lived at least [`VEILID_STABLE_CONNECTION`] resets it.
 #[cfg(feature = "veilid")]
-fn encode_route_blob(blob: &[u8]) -> String {
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    URL_SAFE_NO_PAD.encode(blob)
+#[derive(Debug, Clone, Copy)]
+struct RedialBackoff {
+    next: Duration,
 }
 
-/// Decode a `--veilid-peer` route blob (URL-safe base64, no padding).
 #[cfg(feature = "veilid")]
-fn decode_route_blob(encoded: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    URL_SAFE_NO_PAD.decode(encoded.trim())
+impl RedialBackoff {
+    const fn new() -> Self {
+        Self {
+            next: VEILID_REDIAL_MIN,
+        }
+    }
+
+    /// Record how long the last connection lived.
+    fn connection_closed(&mut self, lived: Duration) {
+        if lived >= VEILID_STABLE_CONNECTION {
+            self.next = VEILID_REDIAL_MIN;
+        }
+    }
+
+    /// The delay to wait now; doubles the following one.
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.saturating_mul(2).min(VEILID_REDIAL_MAX);
+        delay
+    }
 }
 
-/// Short, log-friendly label for a (long) encoded route blob.
-///
-/// Uses the _tail_: encoded blobs share a long common header prefix.
-#[cfg(feature = "veilid")]
-fn route_label(encoded: &str) -> &str {
-    encoded
-        .get(encoded.len().saturating_sub(16)..)
-        .unwrap_or(encoded)
-}
-
-/// Start the Veilid node, spawn its accept loop, and dial `--veilid-peer`s.
+/// Start the Veilid node, spawn its accept loop, and spawn a reconnect
+/// supervisor per `--veilid-peer`.
 ///
 /// Startup waits until the node is attached and has a private route, which
 /// can take a while on a cold start; returns `Ok(None)` if `token` is
@@ -1735,13 +1771,17 @@ async fn start_veilid<H: CliWireHandler>(
     handshake_max_drift: Duration,
 ) -> Result<Option<VeilidRuntime>> {
     use subduction_veilid::{
+        data_dir::prepare_data_dir,
         endpoint::{EndpointConfig, VeilidEndpoint, node_config},
         error::{AcceptError, EndpointError},
     };
 
-    std::fs::create_dir_all(data_dir).map_err(|e| {
+    // Veilid refuses to open stores not owned by our effective uid _and_
+    // gid; on macOS/BSD (and under setgid directories) a fresh directory
+    // inherits its parent's group (e.g. `wheel` under /tmp).
+    prepare_data_dir(data_dir).map_err(|e| {
         eyre::eyre!(
-            "failed to create Veilid data dir {}: {e}",
+            "failed to prepare Veilid data dir {} (it must be owned by our effective user and group): {e}",
             data_dir.display()
         )
     })?;
@@ -1783,8 +1823,8 @@ async fn start_veilid<H: CliWireHandler>(
         ));
     }
 
-    let route = encode_route_blob(&endpoint.route_blob());
-    tracing::info!(route = %route, "Veilid endpoint ready (peers connect with --veilid-peer)");
+    let route = endpoint.route_address();
+    tracing::info!(route = %route, "Veilid private route allocated (changes on route churn and restarts)");
 
     // Accept loop
     let accept_ep = endpoint.clone();
@@ -1815,6 +1855,7 @@ async fn start_veilid<H: CliWireHandler>(
                             tokio::spawn(accepted.listener_task);
                             tokio::spawn(accepted.sender_task);
 
+                            let veilid_conn = accepted.authenticated.inner().clone();
                             let auth = accepted
                                 .authenticated
                                 .map(|c| MessageTransport::new(UnifiedTransport::Veilid(c)));
@@ -1828,6 +1869,7 @@ async fn start_veilid<H: CliWireHandler>(
                                 }
                                 Err(e) => {
                                     tracing::error!(error = %e, "failed to add veilid connection");
+                                    veilid_conn.close();
                                 }
                             }
                         }
@@ -1844,76 +1886,165 @@ async fn start_veilid<H: CliWireHandler>(
         }
     });
 
-    // Connect to Veilid peers
-    for peer_str in &args.veilid_peers {
-        let label = route_label(peer_str).to_owned();
-        let blob = match decode_route_blob(peer_str) {
-            Ok(blob) => blob,
-            Err(e) => {
-                tracing::error!(route = %label, error = %e, "invalid veilid peer route blob");
-                continue;
-            }
+    // One reconnect supervisor per configured peer.
+    for address in &args.veilid_peers {
+        let peer = VeilidPeerDialer {
+            endpoint: endpoint.clone(),
+            address: address.clone(),
+            label: address.label(),
+            subduction: subduction.clone(),
+            ephemeral: ephemeral.clone(),
+            keyhive: keyhive_proto.cloned(),
+            signer: signer.clone(),
+            service_name: service_name.to_owned(),
         };
+        tokio::spawn(supervise_veilid_peer(peer, token.child_token()));
+    }
 
-        let peer_ep = endpoint.clone();
-        let peer_subduction = subduction.clone();
-        let peer_ephemeral = ephemeral.clone();
-        let peer_signer = signer.clone();
-        let peer_cancel = token.clone();
-        let peer_service_name = service_name.to_owned();
-        let peer_keyhive = keyhive_proto.cloned();
-
-        tokio::spawn(async move {
-            match try_connect_veilid(
-                &peer_ep,
-                &blob,
-                &label,
-                &peer_subduction,
-                &peer_ephemeral,
-                peer_keyhive.as_ref(),
-                &peer_signer,
-                &peer_service_name,
-                peer_cancel,
-            )
-            .await
-            {
-                Ok(remote_id) => {
-                    tracing::info!(route = %label, peer = %remote_id, "veilid: connected to peer");
-                }
-                Err(e) => {
-                    tracing::error!(route = %label, error = %e, "veilid: failed to connect to peer");
+    // Our stable address: wait (bounded) until our current route is readable
+    // at it, so the ready file only advertises an address that resolves.
+    let address = tokio::select! {
+        () = token.cancelled() => None,
+        published = time::timeout(VEILID_ADDRESS_WAIT, endpoint.wait_address_published()) => {
+            match published {
+                Ok(address) => address,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        wait = ?VEILID_ADDRESS_WAIT,
+                        "veilid: stable address not published yet; continuing without it (logged once published)"
+                    );
+                    let late_ep = endpoint.clone();
+                    let late_cancel = token.child_token();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            () = late_cancel.cancelled() => {}
+                            published = late_ep.wait_address_published() => {
+                                if let Some(address) = published {
+                                    tracing::info!(address = %address, "Veilid stable address published (peers connect with --veilid-peer)");
+                                }
+                            }
+                        }
+                    });
+                    None
                 }
             }
-        });
+        }
+    };
+    if let Some(address) = &address {
+        tracing::info!(
+            address = %address,
+            "Veilid endpoint ready; stable address published (peers connect with --veilid-peer)"
+        );
+    } else {
+        tracing::info!(
+            route = %route,
+            "Veilid endpoint ready without a stable address (peers can use the route blob until it changes)"
+        );
     }
 
     Ok(Some(VeilidRuntime {
         endpoint,
         accept_task,
         route,
+        address,
     }))
 }
 
-/// Connect to a peer via the Veilid transport (outbound).
+/// Everything needed to (re)dial one `--veilid-peer`.
 #[cfg(feature = "veilid")]
-#[allow(clippy::too_many_arguments)]
-async fn try_connect_veilid<H: CliWireHandler>(
-    endpoint: &subduction_veilid::endpoint::VeilidEndpoint,
-    route_blob: &[u8],
-    label: &str,
-    subduction: &CliSubduction<H>,
-    ephemeral: &CliEphemeralHandler,
-    keyhive_proto: Option<&CliKeyhiveProtocol>,
-    signer: &MemorySigner,
-    service_name: &str,
+struct VeilidPeerDialer<H: CliWireHandler> {
+    endpoint: subduction_veilid::endpoint::VeilidEndpoint,
+    address: subduction_veilid::VeilidAddress,
+    label: String,
+    subduction: CliSubduction<H>,
+    ephemeral: CliEphemeralHandler,
+    keyhive: Option<CliKeyhiveProtocol>,
+    signer: MemorySigner,
+    service_name: String,
+}
+
+/// Keep one `--veilid-peer` connected until `cancel` fires.
+///
+/// Dials (resolving a DHT address afresh every attempt, so a peer that
+/// reallocated its route or restarted is found again), adds the connection,
+/// waits for it to close, and redials with exponential backoff
+/// ([`RedialBackoff`]). Dial failures are logged, never fatal.
+#[cfg(feature = "veilid")]
+async fn supervise_veilid_peer<H: CliWireHandler>(
+    peer: VeilidPeerDialer<H>,
     cancel: CancellationToken,
-) -> Result<PeerId, eyre::Error> {
-    tracing::info!(route = %label, service_name = %service_name, "veilid: connecting via discovery");
+) {
+    let label = peer.label.as_str();
+    if !peer.address.is_record() {
+        tracing::warn!(
+            address = %label,
+            "veilid: peer given as a raw route blob; redials fail once the peer's route changes (prefer its stable DHT address)"
+        );
+    }
+    let mut backoff = RedialBackoff::new();
+    let mut attempt: u64 = 0;
+    loop {
+        attempt += 1;
+        tracing::info!(address = %label, attempt, "veilid: dialing peer");
+        let dialed = tokio::select! {
+            () = cancel.cancelled() => break,
+            dialed = try_connect_veilid(&peer, cancel.clone()) => dialed,
+        };
+        match dialed {
+            Ok((remote_id, closed)) => {
+                tracing::info!(address = %label, peer = %remote_id, attempt, "veilid: connected to peer");
+                attempt = 0;
+                let since = time::Instant::now();
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = closed => {}
+                }
+                let lived = since.elapsed();
+                tracing::info!(
+                    address = %label,
+                    peer = %remote_id,
+                    lived = ?lived,
+                    "veilid: connection to peer closed"
+                );
+                backoff.connection_closed(lived);
+            }
+            Err(e) => {
+                tracing::warn!(address = %label, attempt, error = %e, "veilid: failed to connect to peer");
+            }
+        }
+        let delay = backoff.next_delay();
+        tracing::info!(address = %label, retry_in = ?delay, "veilid: will redial peer");
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            () = time::sleep(delay) => {}
+        }
+    }
+    tracing::debug!(address = %label, "veilid: peer supervisor stopped");
+}
 
-    let audience = Audience::discover(service_name.as_bytes());
+/// Connect to a peer via the Veilid transport (outbound) and add the
+/// connection.
+///
+/// Returns the remote peer ID and a handle that completes when the
+/// connection's listener exits, i.e. when the session has closed (or
+/// `cancel` fired).
+#[cfg(feature = "veilid")]
+async fn try_connect_veilid<H: CliWireHandler>(
+    peer: &VeilidPeerDialer<H>,
+    cancel: CancellationToken,
+) -> Result<(PeerId, tokio::task::JoinHandle<()>), eyre::Error> {
+    let label = peer.label.as_str();
+    tracing::debug!(address = %label, service_name = %peer.service_name, "veilid: connecting via discovery");
 
-    let connect_result =
-        subduction_veilid::client::connect(endpoint, route_blob, signer, audience).await?;
+    let audience = Audience::discover(peer.service_name.as_bytes());
+
+    let connect_result = subduction_veilid::client::connect_address(
+        &peer.endpoint,
+        &peer.address,
+        &peer.signer,
+        audience,
+    )
+    .await?;
 
     let authenticated = connect_result.authenticated;
     let listener_task = connect_result.listener_task;
@@ -1924,14 +2055,14 @@ async fn try_connect_veilid<H: CliWireHandler>(
     let listener_label = label.to_owned();
     let sender_label = label.to_owned();
 
-    tokio::spawn(async move {
+    let closed = tokio::spawn(async move {
         tokio::select! {
             () = listener_cancel.cancelled() => {
-                tracing::debug!(route = %listener_label, "veilid: shutting down listener for peer");
+                tracing::debug!(address = %listener_label, "veilid: shutting down listener for peer");
             }
             result = listener_task => {
                 if let Err(e) = result {
-                    tracing::info!(route = %listener_label, error = %e, "veilid: listener disconnected");
+                    tracing::info!(address = %listener_label, error = %e, "veilid: listener disconnected");
                 }
             }
         }
@@ -1940,28 +2071,33 @@ async fn try_connect_veilid<H: CliWireHandler>(
     tokio::spawn(async move {
         tokio::select! {
             () = sender_cancel.cancelled() => {
-                tracing::debug!(route = %sender_label, "veilid: shutting down sender for peer");
+                tracing::debug!(address = %sender_label, "veilid: shutting down sender for peer");
             }
             result = sender_task => {
                 if let Err(e) = result {
-                    tracing::info!(route = %sender_label, error = %e, "veilid: sender disconnected");
+                    tracing::info!(address = %sender_label, error = %e, "veilid: sender disconnected");
                 }
             }
         }
     });
 
     let remote_id = authenticated.peer_id();
+    let veilid_conn = authenticated.inner().clone();
     let auth = authenticated.map(|c| MessageTransport::new(UnifiedTransport::Veilid(c)));
     let auth_for_keyhive = auth.clone();
-    subduction.add_connection(auth).await?;
-    ephemeral.subscribe_peer(remote_id).await;
-    notify_peer_connect(keyhive_proto, auth_for_keyhive).await;
-    subduction
+    if let Err(e) = peer.subduction.add_connection(auth).await {
+        // Close the session so the listener (and `closed`) ends.
+        veilid_conn.close();
+        return Err(e.into());
+    }
+    peer.ephemeral.subscribe_peer(remote_id).await;
+    notify_peer_connect(peer.keyhive.as_ref(), auth_for_keyhive).await;
+    peer.subduction
         .full_sync_with_peer(&remote_id, true, CallTimeout::Default)
         .await;
 
-    tracing::info!(route = %label, peer = %remote_id, "veilid: added peer");
-    Ok(remote_id)
+    tracing::info!(address = %label, peer = %remote_id, "veilid: added peer");
+    Ok((remote_id, closed))
 }
 
 #[cfg(test)]
@@ -2010,6 +2146,8 @@ mod tests {
     #[cfg(feature = "veilid")]
     #[test]
     fn veilid_flags_parse() {
+        use subduction_veilid::VeilidAddress;
+
         let args = parse(&[
             "--veilid",
             "--veilid-peer",
@@ -2022,12 +2160,40 @@ mod tests {
             "ns",
         ]);
         assert!(args.veilid);
-        assert_eq!(args.veilid_peers, vec!["AAEC".to_owned(), "_-8".to_owned()]);
+        assert_eq!(
+            args.veilid_peers,
+            vec![
+                VeilidAddress::RouteBlob(vec![0, 1, 2]),
+                VeilidAddress::RouteBlob(vec![0xff, 0xef])
+            ]
+        );
         assert_eq!(
             args.veilid_data_dir.as_deref(),
             Some(std::path::Path::new("/tmp/v"))
         );
         assert_eq!(args.veilid_namespace.as_deref(), Some("ns"));
+    }
+
+    #[cfg(feature = "veilid")]
+    #[test]
+    fn veilid_peer_accepts_dht_address() {
+        let key = "VLD0:7l5U7kStQ1AGNo7v6S53ZEdaIfPNs0f0xRYz0hBiZUw:Hd7KyfvNakjBFELJTzGSjQnlqDXaqAyLcmnE6Ay1uHE";
+        let args = parse(&["--veilid-peer", key]);
+        let [peer] = args.veilid_peers.as_slice() else {
+            panic!("expected one peer, got {:?}", args.veilid_peers);
+        };
+        assert!(peer.is_record());
+        assert_eq!(peer.to_string(), key);
+    }
+
+    #[cfg(feature = "veilid")]
+    #[test]
+    fn veilid_peer_rejects_garbage() {
+        assert!(ServerArgs::try_parse_from(["server", "--veilid-peer", "not base64!"]).is_err());
+        assert!(
+            ServerArgs::try_parse_from(["server", "--veilid-peer", "VLD0:not valid!"]).is_err()
+        );
+        assert!(ServerArgs::try_parse_from(["server", "--veilid-peer", ""]).is_err());
     }
 
     #[cfg(feature = "veilid")]
@@ -2042,21 +2208,23 @@ mod tests {
 
     #[cfg(feature = "veilid")]
     #[test]
-    fn route_blob_base64_round_trips() {
-        let blob: Vec<u8> = (0..=255).collect();
-        let encoded = super::encode_route_blob(&blob);
-        assert!(!encoded.contains('='), "no padding");
-        assert!(!encoded.contains('+') && !encoded.contains('/'), "URL-safe");
-        assert_eq!(super::decode_route_blob(&encoded).expect("decode"), blob);
-        // Surrounding whitespace (e.g. pasted from a ready file) is tolerated.
-        assert_eq!(
-            super::decode_route_blob(&format!(" {encoded}\n")).expect("decode"),
-            blob
-        );
-        assert!(super::decode_route_blob("not base64!").is_err());
-        assert_eq!(super::route_label("short"), "short");
-        let label = super::route_label(&encoded);
-        assert_eq!(label.len(), 16);
-        assert!(encoded.ends_with(label));
+    fn redial_backoff_doubles_caps_and_resets() {
+        use std::time::Duration;
+
+        use super::{RedialBackoff, VEILID_REDIAL_MAX, VEILID_STABLE_CONNECTION};
+
+        let mut backoff = RedialBackoff::new();
+        let delays: Vec<u64> = (0..9).map(|_| backoff.next_delay().as_secs()).collect();
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(backoff.next_delay(), VEILID_REDIAL_MAX);
+
+        // A short-lived connection keeps backing off.
+        backoff.connection_closed(Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(), VEILID_REDIAL_MAX);
+
+        // A stable one starts over.
+        backoff.connection_closed(VEILID_STABLE_CONNECTION);
+        assert_eq!(backoff.next_delay().as_secs(), 1);
+        assert_eq!(backoff.next_delay().as_secs(), 2);
     }
 }

@@ -166,15 +166,24 @@ By default, iroh routes traffic through [iroh's public relay infrastructure](htt
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--veilid-peer <ROUTE_BLOB>` | | Veilid peer route blob to connect to (base64 URL-safe, no padding; repeatable) |
+| `--veilid-peer <ADDRESS>` | | Veilid peer to keep connected to: its stable DHT address (`VLD0:...`) or a raw route blob (base64 URL-safe, no padding); repeatable |
 | `--veilid-data-dir <PATH>` | `<data-dir>/veilid` | Directory for Veilid's table, protected, and block stores |
 | `--veilid-namespace <NAME>` | | Veilid namespace, to isolate this node's Veilid storage from other Veilid programs |
 
-Veilid peers are addressed by **private route blobs**, not by public keys or socket addresses. On startup the server allocates a private route, logs it, and writes it to the ready file as `veilid_route=<base64>`. Give that value to peers as their `--veilid-peer`. A route can change: if Veilid reports the server's own route as dead, a new one is allocated and a warning is logged, and peers need the new blob.
+Veilid peers are not addressed by public keys or socket addresses, but by **private routes**. A route blob names one allocation of a node's private route, so it changes on route churn (relays change) and on every restart. The server therefore also publishes its current route blob into a Veilid DHT record it owns and rewrites it whenever the route changes. The record key is the server's **stable address**: its owner keypair is kept in Veilid's table store under `--veilid-data-dir`, so the address stays the same across route changes and restarts as long as that directory (and `--veilid-namespace`) is kept. On startup the server logs both and writes them to the ready file:
 
-Veilid starts after the other transports: attaching to the network and allocating a private route can take minutes on a cold start, so the ready file is written only once Veilid is up. Ctrl+C during startup shuts the half-started node down cleanly; any other Veilid startup failure stops the server. A binary built with `--all-targets` or by `cargo test --workspace` may be linked against veilid-core's in-process mock network (Cargo feature unification); the server detects this and refuses `--veilid`, so build release binaries with `cargo build -p subduction_cli`.
+- `veilid_address=VLD0:...`: the stable address. Give this to peers as their `--veilid-peer`. It is written once the current route is readable at it, which the server waits up to 2 minutes for. If publishing takes longer, the line is left out and the address is logged once it is published.
+- `veilid_route=<base64>`: the current route blob. It still works as a `--veilid-peer` (as in earlier versions) but goes stale once the route changes.
 
-Veilid connections are anonymous at the transport layer. The Subduction handshake is the only peer authentication, exactly as with other transports. Veilid caps each message at 32 KiB, so larger sync messages are split into acknowledged fragments. Throughput is much lower than WebSocket or Iroh, and Veilid suits privacy-sensitive deployments better than bulk sync. See the [`subduction_veilid` README](../subduction_veilid/README.md) for the protocol details.
+Anyone who has either value can open Veilid sessions to the server (they still have to pass the Subduction handshake), so share them like you would share the route blob.
+
+Each `--veilid-peer` gets a reconnect supervisor. It dials the peer, resolving a DHT address to the peer's current route on every attempt. It then adds the connection, waits until the connection closes, and dials again. Delays between attempts start at 1 s and double up to 60 s. A connection that lived at least 60 s resets the delay to 1 s. A failed dial, including the first one, is logged and retried and never stops the server. While a connection is up, `subduction_veilid` rides out route churn itself: it re-imports the peer's route, and it announces a reallocated route of our own to the peer. The supervisor only redials once a session has actually closed, for example after the peer restarted. Only the dialing side redials, so give `--veilid-peer` to at least one side of each pair. Only DHT addresses survive a peer restart. A raw route blob peer is retried with the same blob, which fails once the route has changed.
+
+Veilid starts after the other transports: attaching to the network and allocating a private route can take minutes on a cold start, so the ready file is written only once Veilid is up and has published its stable address (or 2 minutes after that, without it). Ctrl+C during startup shuts the half-started node down cleanly; any other Veilid startup failure stops the server. A binary built with `--all-targets` or by `cargo test --workspace` may be linked against veilid-core's in-process mock network (Cargo feature unification); the server detects this and refuses `--veilid`, so build release binaries with `cargo build -p subduction_cli`.
+
+Veilid refuses to open its stores unless the data directory and everything in it is owned by the process's effective user **and group** (`path has incorrect owner/group`). On macOS/BSD a new directory inherits the group of its parent (e.g. `wheel` under `/tmp`), and on Linux the same happens under a setgid directory. So before starting Veilid the server creates `--veilid-data-dir` and changes it, and the files in it that the server's user owns, to the effective group. Symlinks are not followed. If that fails, the server stops with an error naming the directory. See [Data directory](../subduction_veilid/README.md#data-directory).
+
+Veilid connections are anonymous at the transport layer. The Subduction handshake is the only peer authentication, exactly as with other transports. Veilid caps each message at 32 KiB, so larger sync messages are split into acknowledged fragments. Throughput is much lower than WebSocket or Iroh, and Veilid suits privacy-sensitive deployments better than bulk sync. See the [`subduction_veilid` README](../subduction_veilid/README.md) for the protocol details, [addresses](../subduction_veilid/README.md#addresses), and [route changes](../subduction_veilid/README.md#route-changes).
 
 To build without Veilid (and without the `veilid-core` dependency):
 
@@ -194,7 +203,7 @@ cargo build -p subduction_cli --no-default-features --features native-tls,os-met
 
 | Flag | Description |
 |------|-------------|
-| `--ready-file <PATH>` | Write a file on startup with the assigned port, peer ID, iroh node ID (`iroh_node_id`, `iroh_addrs`), and Veilid route blob (`veilid_route`) |
+| `--ready-file <PATH>` | Write a file on startup with the assigned port (`port`), peer ID (`peer_id`), iroh node ID (`iroh_node_id`, `iroh_addrs`), and the Veilid stable address (`veilid_address`) and current route blob (`veilid_route`) |
 
 ### `purge`
 
@@ -232,13 +241,14 @@ subduction_cli server --key-file ./key --iroh \
 subduction_cli server --key-file ./key --iroh --iroh-direct-only \
   --iroh-peer <node-id> --iroh-peer-addr 192.168.1.50:12345
 
-# Veilid (anonymous private routes); read our route blob from the ready file
+# Veilid (anonymous private routes); read our stable address from the ready file
 subduction_cli server --key-file ./key1 --veilid --ready-file ./ready1
-grep veilid_route ./ready1   # veilid_route=<base64 route blob>
+grep veilid_address ./ready1   # veilid_address=VLD0:...
 
-# Second node connecting to the first over Veilid
+# Second node keeping a connection to the first over Veilid (redials
+# automatically, also after node 1 restarts)
 subduction_cli server --key-file ./key2 --data-dir ./data2 --veilid \
-  --veilid-peer <base64 route blob of node 1>
+  --veilid-peer <veilid_address of node 1>
 
 # Discovery mode (clients connect by service name instead of peer ID)
 subduction_cli server --key-file ./key --service-name sync.example.com
@@ -292,7 +302,7 @@ The flake provides NixOS and Home Manager modules for running Subduction as a ma
               # Veilid transport (anonymous private routes)
               veilid = {
                 enable = true;
-                peers = ["<base64 route blob>"];
+                peers = ["VLD0:..."]; # stable addresses (veilid_address) of peers
                 # dataDir = "/var/lib/subduction/veilid"; # default
                 # namespace = "subduction";
               };

@@ -204,16 +204,24 @@ in {
           default = false;
           description = ''
             Enable the Veilid transport (anonymous P2P over Veilid private
-            routes). The node's route blob is logged at startup and written to
-            the ready file as `veilid_route`.
+            routes). The node's stable DHT address is logged at startup and
+            written to the ready file as `veilid_address` (its current route
+            blob as `veilid_route`). The address stays the same across
+            restarts as long as the Veilid data directory is kept.
           '';
         };
 
         peers = lib.mkOption {
           type = lib.types.listOf lib.types.str;
           default = [];
-          example = ["ARAeUAECAQJRBAEB..."];
-          description = "Veilid peer route blobs (base64 URL-safe, no padding) to connect to on startup.";
+          example = ["VLD0:7l5U7kStQ1AGNo7v6S53ZEdaIfPNs0f0xRYz0hBiZUw:Hd7KyfvNakjBFELJTzGSjQnlqDXaqAyLcmnE6Ay1uHE"];
+          description = ''
+            Veilid peers to keep connected to: each peer's stable DHT address
+            (`veilid_address`, `VLD0:...`) or a raw route blob (base64 URL-safe,
+            no padding; goes stale when the peer's route changes). Each peer is
+            redialed with exponential backoff (1 s to 60 s) whenever the
+            connection drops.
+          '';
         };
 
         dataDir = lib.mkOption {
