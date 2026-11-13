@@ -137,6 +137,18 @@ pub enum ConnectError {
     #[error("failed to open session: {0}")]
     Open(#[from] StreamError),
 
+    /// The peer's private route is dead: Veilid reported it dead, or it was
+    /// unusable, while the OPEN was pending. The blob is stale (e.g. the
+    /// peer restarted): resolve the peer's address again and redial.
+    #[error("peer's private route is dead ({0}); resolve the peer's address again and redial")]
+    RouteDead(String),
+
+    /// The peer did not acknowledge the OPEN within
+    /// [`EndpointConfig::open_timeout`](crate::endpoint::EndpointConfig::open_timeout)
+    /// (retries included).
+    #[error("peer did not acknowledge the session OPEN within {0:?}")]
+    OpenTimeout(core::time::Duration),
+
     /// The handshake did not complete within the configured timeout.
     #[error("handshake timed out")]
     HandshakeTimeout,

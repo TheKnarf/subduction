@@ -1707,6 +1707,21 @@ const VEILID_REDIAL_MAX: Duration = Duration::from_secs(60);
 #[cfg(feature = "veilid")]
 const VEILID_STABLE_CONNECTION: Duration = Duration::from_secs(60);
 
+/// Upper bound of one dial (resolve + OPEN + handshake) of a
+/// `--veilid-peer`. The transport already bounds each step (the address
+/// lookup by `resolve_timeout`, the OPEN by `open_timeout`, failing at once
+/// if the peer's route is reported dead, and the handshake by
+/// `handshake_timeout`); this is a backstop so a hung dial can never stall
+/// the supervisor, which then re-resolves and redials. Cancelling a dial is
+/// safe: a half-open session is closed.
+#[cfg(feature = "veilid")]
+const fn veilid_dial_timeout(config: &subduction_veilid::endpoint::EndpointConfig) -> Duration {
+    config
+        .resolve_timeout
+        .saturating_add(config.open_timeout)
+        .saturating_add(config.handshake_timeout)
+}
+
 /// A running Veilid transport: the endpoint, its accept loop, our current
 /// route blob, and our stable DHT address (if published in time).
 #[cfg(feature = "veilid")]
@@ -1968,7 +1983,12 @@ struct VeilidPeerDialer<H: CliWireHandler> {
 /// Dials (resolving a DHT address afresh every attempt, so a peer that
 /// reallocated its route or restarted is found again), adds the connection,
 /// waits for it to close, and redials with exponential backoff
-/// ([`RedialBackoff`]). Dial failures are logged, never fatal.
+/// ([`RedialBackoff`]). Dial failures are logged, never fatal. Every dial is
+/// bounded ([`veilid_dial_timeout`]; an OPEN to a stale route fails within
+/// the transport's `open_timeout`, or at once if Veilid reports the route
+/// dead), and an open connection to a peer that vanished is closed by the
+/// transport within about `keepalive_interval + route_recovery_timeout`, so
+/// the supervisor always gets to redial.
 #[cfg(feature = "veilid")]
 async fn supervise_veilid_peer<H: CliWireHandler>(
     peer: VeilidPeerDialer<H>,
@@ -2038,13 +2058,18 @@ async fn try_connect_veilid<H: CliWireHandler>(
 
     let audience = Audience::discover(peer.service_name.as_bytes());
 
-    let connect_result = subduction_veilid::client::connect_address(
-        &peer.endpoint,
-        &peer.address,
-        &peer.signer,
-        audience,
+    let dial_timeout = veilid_dial_timeout(peer.endpoint.config());
+    let connect_result = time::timeout(
+        dial_timeout,
+        subduction_veilid::client::connect_address(
+            &peer.endpoint,
+            &peer.address,
+            &peer.signer,
+            audience,
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| eyre::eyre!("dial did not complete within {dial_timeout:?}"))??;
 
     let authenticated = connect_result.authenticated;
     let listener_task = connect_result.listener_task;
@@ -2204,6 +2229,23 @@ mod tests {
         assert!(args.veilid_peers.is_empty());
         assert!(args.veilid_data_dir.is_none());
         assert!(args.veilid_namespace.is_none());
+    }
+
+    #[cfg(feature = "veilid")]
+    #[test]
+    fn veilid_dial_timeout_covers_open_and_handshake() {
+        use std::time::Duration;
+
+        use subduction_veilid::endpoint::EndpointConfig;
+
+        use super::veilid_dial_timeout;
+
+        let config = EndpointConfig::default();
+        let timeout = veilid_dial_timeout(&config);
+        // Never cuts the transport's own (tighter) bounds short ...
+        assert!(timeout >= config.resolve_timeout + config.open_timeout + config.handshake_timeout);
+        // ... but a hung dial is abandoned within minutes, not never.
+        assert!(timeout <= Duration::from_secs(300), "{timeout:?}");
     }
 
     #[cfg(feature = "veilid")]

@@ -24,9 +24,16 @@
 //!
 //! * When a peer's imported route is reported dead (or sends to it fail with
 //!   `InvalidTarget` / repeated `NoConnection`), the session re-imports the
-//!   peer's saved route blob. If that fails, the session waits in a
-//!   _route-lost_ state for up to [`EndpointConfig::route_recovery_timeout`]
-//!   for the peer to announce a new route; sends wait instead of failing.
+//!   peer's saved route blob, but only if we have heard from the peer since
+//!   the previous re-import. Otherwise (or if re-importing fails) the
+//!   session waits in a _route-lost_ state for up to
+//!   [`EndpointConfig::route_recovery_timeout`] for the peer to announce a
+//!   new route, probing the peer over its saved route meanwhile (a session
+//!   dialled by DHT address also re-resolves it and probes a new blob found
+//!   there); sends wait instead of failing. A session whose OPEN is still pending gets no
+//!   recovery at all: the OPEN fails at once.
+//! * Every send is bounded overall (see [`EndpointConfig::open_timeout`] and
+//!   [`EndpointConfig::send_deadline`]), so no send retries forever.
 //! * When **our** route dies, a new one is allocated and announced to every
 //!   peer with a `ROUTE_UPDATE` frame, and republished to our DHT address.
 //!
@@ -67,7 +74,7 @@ use crate::{
     error::{ConnectError, EndpointError, StreamError},
     frame::{
         Frame, MAX_MESSAGE_SIZE, NackReason, Reply, SessionId, encode_close, encode_open,
-        encode_route_update,
+        encode_ping, encode_route_update,
     },
     session::{CLOSE_INTERNAL, CLOSE_NORMAL, Limits, Session, SessionShared, keepalive, pump},
 };
@@ -82,8 +89,33 @@ const DISPATCH_QUEUE_CAPACITY: usize = 4096;
 /// ample for the Subduction handshake messages.
 pub const DEFAULT_UNAUTHENTICATED_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
-/// Default for [`EndpointConfig::route_recovery_timeout`] (2 minutes).
-pub const DEFAULT_ROUTE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default for [`EndpointConfig::route_recovery_timeout`] (60 s).
+///
+/// Long enough for a peer to allocate and announce a new route (seconds on
+/// an attached node) or to restart and republish its address, to span
+/// several of Veilid's dead-route reports (roughly every 15 s), and for a
+/// few recovery probes (every 10 s); longer than the default 30 s keepalive
+/// interval, so a live peer's PING is heard. Short enough that a vanished
+/// peer's session is closed, and redialled, within about
+/// `keepalive_interval + 60 s`.
+pub const DEFAULT_ROUTE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default for [`EndpointConfig::open_timeout`] (30 s).
+pub const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default for [`EndpointConfig::resolve_timeout`] (60 s).
+pub const DEFAULT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// OPEN attempts that fit in [`EndpointConfig::open_timeout`] (each attempt
+/// gets at most a third of it), so a lost OPEN or ACK is retransmitted.
+const OPEN_ATTEMPTS_PER_TIMEOUT: u32 = 3;
+
+/// Maximum interval between recovery rounds (probing the peer's saved
+/// route, re-resolving its address) of a session whose peer route is lost;
+/// shortened to a quarter of
+/// [`route_recovery_timeout`](EndpointConfig::route_recovery_timeout) if
+/// that is shorter. Bounds the re-resolve frequency per session.
+const RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Veilid table (in [`AddressKeyStore::TableStore`]) holding the address
 /// record's keys.
@@ -196,9 +228,28 @@ pub struct EndpointConfig {
 
     /// How long a session whose peer route was lost (reported dead and not
     /// re-importable, or failing even after a re-import) waits for the peer
-    /// to announce a new route (`ROUTE_UPDATE`) before it is closed. Sends
-    /// and keepalives wait during that time instead of failing.
+    /// to announce a new route (`ROUTE_UPDATE`, or a new blob at the address
+    /// we dialled) or to answer one of our probes over its saved (or
+    /// re-resolved) route, before it is closed. Sends and keepalives wait
+    /// during that time instead of failing. A vanished peer's session is
+    /// thus closed within about `keepalive_interval +
+    /// route_recovery_timeout` once Veilid reports its route dead.
     pub route_recovery_timeout: Duration,
+
+    /// Hard deadline for opening a session: the OPEN frame, all its retries
+    /// included, must be acknowledged within this time. An OPEN gets no
+    /// route recovery: if the peer's route is reported dead or unusable
+    /// while it is pending, it fails at once
+    /// ([`ConnectError::RouteDead`]), so the caller can re-resolve the
+    /// peer's address and redial. Each attempt is limited to
+    /// `min(call_timeout, open_timeout / 3)`, so a lost OPEN (or a lost
+    /// ACK) is retransmitted within the deadline.
+    pub open_timeout: Duration,
+
+    /// Deadline for resolving a DHT address ([`VeilidEndpoint::resolve`],
+    /// and the lookup in [`VeilidEndpoint::open_session_to`]), including
+    /// waiting for other resolutions in progress.
+    pub resolve_timeout: Duration,
 
     /// Publish our current route blob in a DHT record we own, so peers can
     /// reach us at a stable [`VeilidEndpoint::address`] across route
@@ -228,9 +279,40 @@ impl Default for EndpointConfig {
             close_timeout: Duration::from_secs(5),
             keepalive_interval: Some(Duration::from_secs(30)),
             route_recovery_timeout: DEFAULT_ROUTE_RECOVERY_TIMEOUT,
+            open_timeout: DEFAULT_OPEN_TIMEOUT,
+            resolve_timeout: DEFAULT_RESOLVE_TIMEOUT,
             publish_address: true,
             address_key_store: AddressKeyStore::TableStore,
         }
+    }
+}
+
+impl EndpointConfig {
+    /// Overall deadline of sending one frame of an open session: every
+    /// attempt (`max_send_attempts` of up to `call_timeout` plus backoff)
+    /// and waiting for a lost route to come back
+    /// (`route_recovery_timeout`). Time spent waiting out a busy receiver
+    /// (bounded by `max_busy_wait`) does not count.
+    #[must_use]
+    pub fn send_deadline(&self) -> Duration {
+        self.call_timeout
+            .saturating_add(self.max_backoff)
+            .saturating_mul(self.max_send_attempts.max(1))
+            .saturating_add(self.route_recovery_timeout)
+    }
+
+    /// Time for every attempt of one frame (`max_send_attempts` of up to
+    /// `call_timeout`, plus backoff), not counting any waiting.
+    pub(crate) fn attempts_budget(&self) -> Duration {
+        self.call_timeout
+            .saturating_add(self.max_backoff)
+            .saturating_mul(self.max_send_attempts.max(1))
+    }
+
+    /// Interval between recovery rounds of a session whose peer route is
+    /// lost.
+    pub(crate) fn recovery_interval(&self) -> Duration {
+        RECOVERY_INTERVAL.min(self.route_recovery_timeout / 4)
     }
 }
 
@@ -389,13 +471,77 @@ struct PublishState {
     stopped: bool,
 }
 
+/// Overall time budget of one [`EndpointInner::call_with`].
+#[derive(Debug, Clone, Copy)]
+struct Budget {
+    /// Total time allowed.
+    total: Duration,
+    /// Time spent on busy refusals (backpressure, bounded separately by
+    /// [`EndpointConfig::max_busy_wait`]) extends the deadline.
+    excluding_busy: bool,
+    /// Time spent waiting for a lost session route to come back (bounded
+    /// separately: the route recovery deadline closes the session) extends
+    /// the deadline.
+    excluding_route_wait: bool,
+    /// Limit of one attempt, if shorter than
+    /// [`EndpointConfig::call_timeout`].
+    per_attempt: Option<Duration>,
+}
+
+impl Budget {
+    /// Nothing extends the deadline, and each attempt gets at most
+    /// `per_attempt` (the OPEN).
+    const fn hard(total: Duration, per_attempt: Duration) -> Self {
+        Self {
+            total,
+            excluding_busy: false,
+            excluding_route_wait: false,
+            per_attempt: Some(per_attempt),
+        }
+    }
+
+    /// Busy backpressure waits do not count against the deadline.
+    const fn excluding_busy(total: Duration) -> Self {
+        Self {
+            total,
+            excluding_busy: true,
+            excluding_route_wait: false,
+            per_attempt: None,
+        }
+    }
+
+    /// Only actual attempts count against the deadline: neither busy waits
+    /// nor waiting for a lost route (a keepalive probe).
+    const fn attempts_only(total: Duration) -> Self {
+        Self {
+            total,
+            excluding_busy: true,
+            excluding_route_wait: true,
+            per_attempt: None,
+        }
+    }
+}
+
+/// Outcome of [`EndpointInner::probe`].
+enum Probe {
+    /// The peer answered over the (imported, counted) route.
+    Alive(RouteId),
+    /// The peer answered that it does not know the session: it restarted
+    /// (or closed the session and the CLOSE was lost).
+    Gone,
+    /// No usable answer.
+    Unreachable,
+}
+
 /// How [`EndpointInner::call_with`] reaches the peer.
 #[derive(Clone, Copy)]
 enum Via<'a> {
     /// A fixed route; failures are returned as they are.
     Route(&'a RouteId),
     /// A session's current route, waiting while it is lost. With `recover`,
-    /// a failing route is re-imported once and then declared lost.
+    /// a failing route is re-imported (if the peer has been heard from
+    /// since the last re-import) and otherwise declared lost; without it
+    /// (a pending OPEN), a bad route fails the call.
     Session {
         session: &'a Arc<SessionShared>,
         recover: bool,
@@ -597,7 +743,12 @@ impl EndpointInner {
     /// Send a CLOSE frame, retrying transient failures (and busy refusals)
     /// until `deadline`; the outcome is only logged.
     async fn notify_close(self: &Arc<Self>, route: &RouteId, frame: Vec<u8>, deadline: Duration) {
-        let attempt = self.call_with(Via::Route(route), &frame, false);
+        let attempt = self.call_with(
+            Via::Route(route),
+            &frame,
+            false,
+            Budget::excluding_busy(deadline),
+        );
         match tokio::time::timeout(deadline, attempt).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::debug!(error = %e, "veilid: CLOSE frame not delivered"),
@@ -609,7 +760,8 @@ impl EndpointInner {
     /// failures with bounded exponential backoff, busy refusals for up to
     /// [`EndpointConfig::max_busy_wait`], and riding out route changes
     /// (re-import, then waiting for the peer's `ROUTE_UPDATE` for up to
-    /// [`EndpointConfig::route_recovery_timeout`]).
+    /// [`EndpointConfig::route_recovery_timeout`]). Bounded overall by
+    /// [`EndpointConfig::send_deadline`].
     pub(crate) async fn call_session(
         self: &Arc<Self>,
         session: &Arc<SessionShared>,
@@ -622,8 +774,145 @@ impl EndpointInner {
             },
             frame,
             true,
+            Budget::excluding_busy(self.config.send_deadline()),
         )
         .await
+    }
+
+    /// [`call_session`](Self::call_session) for a keepalive probe: as many
+    /// attempts as any frame gets ([`EndpointConfig::attempts_budget`]),
+    /// but time spent waiting for a lost route does not count against
+    /// them. That wait is bounded by the route recovery deadline (which
+    /// closes the session), so a vanished peer's session is still closed
+    /// within about `keepalive_interval + route_recovery_timeout` once its
+    /// route is lost, while a few lost replies never close a live session.
+    pub(crate) async fn ping_session(
+        self: &Arc<Self>,
+        session: &Arc<SessionShared>,
+        frame: &[u8],
+    ) -> Result<(), StreamError> {
+        self.call_with(
+            Via::Session {
+                session,
+                recover: true,
+            },
+            frame,
+            true,
+            Budget::attempts_only(self.config.attempts_budget()),
+        )
+        .await
+    }
+
+    /// Call (with no retries and no session state) `blob`'s route with
+    /// `frame`, a PING of `session`: is the peer reachable over it?
+    async fn probe(&self, session: &SessionShared, blob: &[u8], frame: &[u8]) -> Probe {
+        let route = match self.import_route(blob) {
+            Ok(route) => route,
+            Err(e) => {
+                tracing::debug!(session = %session.id, error = %e, "veilid: cannot import the route to probe");
+                return Probe::Unreachable;
+            }
+        };
+        let call = tokio::time::timeout(
+            self.config.call_timeout,
+            self.routing
+                .app_call(Target::RouteId(route.clone()), frame.to_vec()),
+        )
+        .await;
+        let outcome = match call {
+            Ok(Ok(reply)) => match Reply::decode(&reply) {
+                Ok(Reply::Ack | Reply::Nack(NackReason::Busy)) => return Probe::Alive(route),
+                Ok(Reply::Nack(NackReason::UnknownSession)) => Probe::Gone,
+                Ok(Reply::Nack(other)) => {
+                    tracing::debug!(session = %session.id, reason = ?other, "veilid: route probe refused");
+                    Probe::Unreachable
+                }
+                Err(e) => {
+                    tracing::debug!(session = %session.id, error = %e, "veilid: malformed reply to a route probe");
+                    Probe::Unreachable
+                }
+            },
+            Ok(Err(e)) => {
+                tracing::debug!(session = %session.id, error = %e, "veilid: route probe failed");
+                Probe::Unreachable
+            }
+            Err(_) => {
+                tracing::debug!(session = %session.id, "veilid: route probe timed out");
+                Probe::Unreachable
+            }
+        };
+        self.release_route(&route);
+        outcome
+    }
+
+    /// Await one app call (already bounded by its own timeout). For a
+    /// session, gives up as soon as the session closes, so a closed (or
+    /// failed-while-opening) session never waits out a call to a dead route.
+    async fn await_call<F>(via: Via<'_>, call: F) -> Result<F::Output, StreamError>
+    where
+        F: Future,
+    {
+        let Via::Session { session, .. } = via else {
+            return Ok(call.await);
+        };
+        let mut call = core::pin::pin!(call);
+        loop {
+            let notified = session.route_changed.notified();
+            let mut notified = core::pin::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(e) = session.closed_error() {
+                return Err(e);
+            }
+            match futures::future::select(call.as_mut(), notified).await {
+                futures::future::Either::Left((out, _)) => return Ok(out),
+                // A route change or a close: re-check.
+                futures::future::Either::Right(((), _)) => {}
+            }
+        }
+    }
+
+    /// The route to send the next attempt of a call over, with its epoch and
+    /// authority, waiting (for up to `remaining`) while a session's route is
+    /// lost.
+    async fn route_for(
+        &self,
+        via: Via<'_>,
+        remaining: Duration,
+    ) -> Result<(RouteId, u64, u64), StreamError> {
+        match via {
+            Via::Route(route) => Ok((route.clone(), 0, 0)),
+            Via::Session { session, .. } => {
+                tokio::time::timeout(remaining, self.wait_route(session))
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::debug!(session = %session.id, "veilid: peer's route did not come back within the frame's deadline");
+                        Err(StreamError::Timeout)
+                    })
+            }
+        }
+    }
+
+    /// [`route_for`](Self::route_for) the next attempt of a call with
+    /// `budget` and `deadline`, moving the deadline by the time spent
+    /// waiting for a lost route if the budget excludes that.
+    async fn next_route(
+        &self,
+        via: Via<'_>,
+        budget: Budget,
+        deadline: &mut tokio::time::Instant,
+    ) -> Result<(RouteId, u64, u64), StreamError> {
+        let now = tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        if !budget.excluding_route_wait {
+            return self.route_for(via, remaining).await;
+        }
+        // The route recovery deadline bounds this wait (it closes the
+        // session); the cap is only a backstop.
+        let route = self
+            .route_for(via, remaining.max(self.config.route_recovery_timeout))
+            .await?;
+        *deadline += now.elapsed();
+        Ok(route)
     }
 
     async fn call_with(
@@ -631,13 +920,17 @@ impl EndpointInner {
         via: Via<'_>,
         frame: &[u8],
         stop_when_closed: bool,
+        budget: Budget,
     ) -> Result<(), StreamError> {
         let initial_backoff = self.config.initial_backoff;
         let mut backoff = initial_backoff;
         let mut attempt = 1u32;
         let mut busy_since: Option<tokio::time::Instant> = None;
-        // Epoch of the session route used by the previous attempt.
-        let mut last_epoch: Option<u64> = None;
+        let mut deadline = tokio::time::Instant::now() + budget.total;
+        // Authority of the session route used by the previous attempt: only
+        // an authoritative new route (ROUTE_UPDATE, freshly resolved blob)
+        // earns a fresh attempt budget, never a re-import of the same blob.
+        let mut last_authority: Option<u64> = None;
         // The route epoch our last re-import produced: if that fails too,
         // give up on re-importing and wait for the peer's ROUTE_UPDATE.
         let mut reimported: Option<u64> = None;
@@ -645,22 +938,34 @@ impl EndpointInner {
             if stop_when_closed && self.is_closed() {
                 return Err(StreamError::EndpointClosed);
             }
-            let (route, epoch) = match via {
-                Via::Route(route) => (route.clone(), 0),
-                Via::Session { session, .. } => self.wait_route(session).await?,
-            };
-            // A newly installed route (even a re-import of the same blob,
-            // which has the same `RouteId`) gets a fresh attempt budget.
-            if last_epoch.is_some_and(|last| last != epoch) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::debug!(budget = ?budget.total, "veilid: frame not acknowledged within its overall deadline");
+                return Err(StreamError::Timeout);
+            }
+            let (route, epoch, authority) = self.next_route(via, budget, &mut deadline).await?;
+            if last_authority.is_some_and(|last| last != authority) {
                 attempt = 1;
                 backoff = initial_backoff;
             }
-            last_epoch = Some(epoch);
+            last_authority = Some(authority);
 
-            let call = self
-                .routing
-                .app_call(Target::RouteId(route.clone()), frame.to_vec());
-            let err = match tokio::time::timeout(self.config.call_timeout, call).await {
+            let started = tokio::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(started);
+            let per_attempt = budget.per_attempt.map_or(self.config.call_timeout, |l| {
+                l.min(self.config.call_timeout)
+            });
+            let call = tokio::time::timeout(
+                per_attempt.min(remaining),
+                self.routing
+                    .app_call(Target::RouteId(route.clone()), frame.to_vec()),
+            );
+            let outcome = Self::await_call(via, call).await?;
+            let mut route_handled = false;
+            if let (Ok(Ok(_)), Via::Session { session, .. }) = (&outcome, via) {
+                session.mark_heard();
+            }
+            let err = match outcome {
                 Ok(Ok(reply)) => match Reply::decode(&reply)? {
                     Reply::Ack => return Ok(()),
                     Reply::Nack(NackReason::Busy) => {
@@ -672,7 +977,17 @@ impl EndpointInner {
                             return Err(StreamError::Rejected(NackReason::Busy));
                         }
                         tracing::trace!(?backoff, "veilid: receiver busy; retrying");
-                        tokio::time::sleep(backoff).await;
+                        let wait = if budget.excluding_busy {
+                            backoff
+                        } else {
+                            backoff.min(
+                                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            )
+                        };
+                        tokio::time::sleep(wait).await;
+                        if budget.excluding_busy {
+                            deadline += started.elapsed();
+                        }
                         backoff = backoff.saturating_mul(2).min(self.config.max_backoff);
                         continue;
                     }
@@ -693,7 +1008,12 @@ impl EndpointInner {
                             {
                                 reimported = Some(new);
                             }
-                            continue;
+                            // Retried on the re-imported (or recovered)
+                            // route, bounded by the deadline; backing off
+                            // too, so a route that keeps failing fast is
+                            // not hammered.
+                            route_handled = true;
+                            StreamError::Veilid(e)
                         }
                         Via::Session { .. } | Via::Route(_) => {
                             return Err(StreamError::Veilid(e));
@@ -705,22 +1025,28 @@ impl EndpointInner {
                 Err(_) => StreamError::Timeout,
             };
 
-            if attempt >= self.config.max_send_attempts {
+            if attempt >= self.config.max_send_attempts && !route_handled {
                 return Err(err);
             }
             tracing::debug!(attempt, error = %err, ?backoff, "veilid: frame not acknowledged; retrying");
-            tokio::time::sleep(backoff).await;
+            tokio::time::sleep(
+                backoff.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
             backoff = backoff.saturating_mul(2).min(self.config.max_backoff);
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
         }
     }
 
     /// Sends to the session's route (of `epoch`) keep failing: re-import the
-    /// peer's saved blob once (installing it before releasing the failing
-    /// one, so Veilid never drops a route we are about to use again); if the
-    /// re-imported route fails as well, or the re-import fails, declare the
-    /// route lost (the session then waits for a `ROUTE_UPDATE`). Returns the
-    /// epoch of the re-imported route, if one was installed.
+    /// peer's saved blob once per call (installing it before releasing the
+    /// failing one, so Veilid never drops a route we are about to use
+    /// again). If the re-imported route fails as well, or the re-import
+    /// fails, declare the route lost (the session then waits for a
+    /// `ROUTE_UPDATE`, or a new blob at the address we dialled). The re-import
+    /// does not refresh the call's attempt budget, and the call has an
+    /// overall deadline, so this is bounded. Returns the epoch of the
+    /// re-imported route, if one was installed.
     fn handle_bad_route(
         self: &Arc<Self>,
         session: &Arc<SessionShared>,
@@ -733,6 +1059,7 @@ impl EndpointInner {
                 tracing::info!(
                     session = %session.id,
                     %error,
+                    silent_for = ?session.silent_for(),
                     "veilid: peer's route still failing after re-import; waiting for the peer to announce a new route"
                 );
             }
@@ -742,7 +1069,7 @@ impl EndpointInner {
             Ok(route) => {
                 // `None` if someone else replaced the route meanwhile; the
                 // caller then picks up that one.
-                let installed = self.swap_route_if(session, epoch, route);
+                let installed = self.install_reimport(session, epoch, route);
                 if installed.is_some() {
                     tracing::info!(session = %session.id, %error, "veilid: peer's route failing; re-imported it");
                 }
@@ -760,7 +1087,10 @@ impl EndpointInner {
     /// Wait until `session` has a usable route (it may be lost, awaiting a
     /// `ROUTE_UPDATE`), returning it with its epoch. Fails once the session
     /// or endpoint closes.
-    async fn wait_route(&self, session: &SessionShared) -> Result<(RouteId, u64), StreamError> {
+    async fn wait_route(
+        &self,
+        session: &SessionShared,
+    ) -> Result<(RouteId, u64, u64), StreamError> {
         loop {
             let notified = session.route_changed.notified();
             let mut notified = core::pin::pin!(notified);
@@ -794,7 +1124,78 @@ impl EndpointInner {
             (route, remote.epoch)
         };
         self.release_route(&route);
-        self.spawn_route_recovery_deadline(session, lost_epoch);
+        self.route_lost(session, lost_epoch);
+        true
+    }
+
+    /// `session`'s route was lost in `epoch`: arm the recovery deadline and
+    /// start actively recovering the route.
+    fn route_lost(self: &Arc<Self>, session: &Arc<SessionShared>, epoch: u64) {
+        self.spawn_route_recovery_deadline(session, epoch);
+        self.spawn_recovery(session);
+    }
+
+    /// While `session`'s route is lost, try to get it back instead of only
+    /// waiting for the peer: every
+    /// [`recovery_interval`](EndpointConfig::recovery_interval), probe the
+    /// peer over its saved route (one PING, no retries), so two live peers
+    /// that both lost each other's route find each other again; and, for a
+    /// session opened via a DHT address, re-resolve the address and probe a
+    /// different blob found there. A probe the peer answers installs that
+    /// route (a resolved blob as an authoritative new route); a peer that
+    /// answers "unknown session" restarted, and the session is closed at
+    /// once so it can be redialled. One task per session; bounded by the
+    /// route recovery deadline.
+    fn spawn_recovery(self: &Arc<Self>, session: &Arc<SessionShared>) {
+        if session.recovering.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let endpoint = Arc::downgrade(self);
+        let weak = Arc::downgrade(session);
+        tokio::spawn(async move {
+            recover_lost_route(&endpoint, &weak).await;
+            if let Some(s) = weak.upgrade() {
+                s.recovering.store(false, Ordering::Release);
+                // Lost again while we were finishing: go on.
+                if let Some(ep) = endpoint.upgrade()
+                    && s.current_route().is_none()
+                    && !s.is_closed()
+                    && !ep.is_closed()
+                {
+                    ep.spawn_recovery(&s);
+                }
+            }
+        });
+    }
+
+    /// Install the imported (already counted) `route` for `blob`, freshly
+    /// resolved from the peer's address, as an authoritative new route, if
+    /// the route is still lost and nothing authoritative (a `ROUTE_UPDATE`)
+    /// replaced it since `authority`. Otherwise releases `route`.
+    fn install_resolved(
+        &self,
+        session: &SessionShared,
+        authority: u64,
+        route: RouteId,
+        blob: Vec<u8>,
+    ) -> bool {
+        let unused = {
+            let mut remote = lock(&session.remote);
+            if session.is_closed() || remote.authority != authority || remote.id.is_some() {
+                Some(route)
+            } else {
+                remote.blob = blob;
+                remote.authority += 1;
+                remote.epoch += 1;
+                remote.id = Some(route);
+                None
+            }
+        };
+        if let Some(route) = unused {
+            self.release_route(&route);
+            return false;
+        }
+        session.route_changed.notify_waiters();
         true
     }
 
@@ -820,17 +1221,20 @@ impl EndpointInner {
         });
     }
 
-    /// Install the imported (already counted) `route` into `session` if its
-    /// route is still that of `epoch` (and the session is open), releasing
-    /// the route it replaces; otherwise release `route`. Returns the new
-    /// epoch if installed.
-    fn swap_route_if(&self, session: &SessionShared, epoch: u64, route: RouteId) -> Option<u64> {
+    /// Install the re-imported (already counted) saved blob's `route` into
+    /// `session` if its route is still that of `epoch` (and the session is
+    /// open), releasing the route it replaces; otherwise release `route`.
+    /// Records the re-import (see [`SessionShared::may_reimport`]); it is
+    /// not authoritative, so it does not refresh any send's attempt budget.
+    /// Returns the new epoch if installed.
+    fn install_reimport(&self, session: &SessionShared, epoch: u64, route: RouteId) -> Option<u64> {
         let (installed, release) = {
             let mut remote = lock(&session.remote);
             if session.is_closed() || remote.epoch != epoch {
                 (None, Some(route))
             } else {
                 remote.epoch += 1;
+                remote.heard_at_reimport = session.heard();
                 (Some(remote.epoch), remote.id.replace(route))
             }
         };
@@ -862,6 +1266,7 @@ impl EndpointInner {
                 remote.generation = generation;
                 remote.blob = blob;
                 remote.epoch += 1;
+                remote.authority += 1;
                 (true, remote.id.replace(route))
             }
         };
@@ -873,6 +1278,30 @@ impl EndpointInner {
         }
     }
 
+    /// A frame of `session` arrived: the peer is alive. If its route is lost
+    /// (and the session open, past its OPEN), re-import the saved blob: the
+    /// route was most likely fine, and only our copy of it was dropped.
+    fn heard_from(&self, session: &SessionShared) {
+        session.mark_heard();
+        let epoch = {
+            let remote = lock(&session.remote);
+            if remote.id.is_some() || remote.opening || session.is_closed() {
+                return;
+            }
+            remote.epoch
+        };
+        match self.import_route(&session.remote_blob()) {
+            Ok(route) => {
+                if self.install_reimport(session, epoch, route).is_some() {
+                    tracing::info!(session = %session.id, "veilid: heard from the peer while its route was lost; re-imported its route");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(session = %session.id, error = %e, "veilid: re-importing a live peer's route failed");
+            }
+        }
+    }
+
     /// Answer an inbound app call.
     pub(crate) async fn reply(&self, call_id: OperationId, reply: Reply) {
         if let Err(e) = self.api.app_call_reply(call_id, reply.encode()).await {
@@ -880,7 +1309,11 @@ impl EndpointInner {
         }
     }
 
-    async fn open_session(self: &Arc<Self>, remote_blob: &[u8]) -> Result<Session, ConnectError> {
+    async fn open_session(
+        self: &Arc<Self>,
+        remote_blob: &[u8],
+        address: Option<VeilidAddress>,
+    ) -> Result<Session, ConnectError> {
         if self.is_closed() {
             return Err(StreamError::EndpointClosed.into());
         }
@@ -894,15 +1327,26 @@ impl EndpointInner {
             remote_blob.to_vec(),
             true,
             self.config.inbound_queue_capacity,
+            address,
         );
         if let Err(nack) = self.register(&shared) {
             self.release_route(&route);
             return Err(StreamError::Rejected(nack).into());
         }
+        // Closes the session if this future is dropped (cancelled) before
+        // it returns a `Session`, which would otherwise own it.
+        let guard = OpenGuard {
+            endpoint: self.clone(),
+            session: shared.clone(),
+            armed: true,
+        };
         self.spawn_pump(&shared, frames_rx);
 
+        let open_timeout = self.config.open_timeout;
         let opened = match encode_open(id, &self.own_route_blob()) {
-            // No route recovery for the OPEN: a stale blob should fail fast.
+            // No route recovery for the OPEN, and a hard deadline: a stale
+            // blob or a vanished peer must fail fast, so the caller can
+            // re-resolve and redial.
             Ok(frame) => {
                 self.call_with(
                     Via::Session {
@@ -911,15 +1355,36 @@ impl EndpointInner {
                     },
                     &frame,
                     true,
+                    Budget::hard(open_timeout, open_timeout / OPEN_ATTEMPTS_PER_TIMEOUT),
                 )
                 .await
             }
             Err(e) => Err(e.into()),
         };
-        if let Err(e) = opened {
+        // Leave the opening state under the route lock: from here on, the
+        // dispatcher treats a dead route like any open session's.
+        let died = {
+            let mut remote = lock(&shared.remote);
+            remote.opening = false;
+            remote.died_while_opening
+        };
+        let failure = match opened {
+            Err(_) | Ok(()) if died => Some(ConnectError::RouteDead(
+                "reported dead by Veilid while the OPEN was pending".to_owned(),
+            )),
+            Ok(()) => shared.closed_error().map(ConnectError::Open),
+            Err(StreamError::Veilid(e)) if is_route_error(&e) => {
+                Some(ConnectError::RouteDead(e.to_string()))
+            }
+            Err(StreamError::Timeout) => Some(ConnectError::OpenTimeout(open_timeout)),
+            Err(e) => Some(e.into()),
+        };
+        if let Some(e) = failure {
+            tracing::debug!(session = %id, error = %e, "veilid: opening session failed");
             self.close_session(&shared, CLOSE_INTERNAL, "open failed", false);
-            return Err(e.into());
+            return Err(e);
         }
+        guard.disarm();
         self.spawn_keepalive(&shared);
 
         tracing::debug!(session = %id, "veilid: session opened");
@@ -959,6 +1424,7 @@ impl EndpointInner {
             blob,
             false,
             self.config.inbound_queue_capacity,
+            None,
         );
         if let Err(nack) = self.register(&shared) {
             self.release_route(&route);
@@ -992,8 +1458,10 @@ impl EndpointInner {
         };
         if generation <= lock(&session.remote).generation {
             // A retransmit, or an older update arriving late.
+            self.heard_from(&session);
             return Reply::Ack;
         }
+        session.mark_heard();
         let route = match self.import_route(&blob) {
             Ok(route) => route,
             Err(e) => {
@@ -1023,7 +1491,9 @@ impl EndpointInner {
             // Keepalive: answered here, independent of the session's pump
             // (which may be refusing data as busy).
             Ok(Frame::Ping { session_id }) => {
-                if lock(&self.state).sessions.contains_key(&session_id) {
+                let session = lock(&self.state).sessions.get(&session_id).cloned();
+                if let Some(s) = session {
+                    self.heard_from(&s);
                     Reply::Ack
                 } else {
                     Reply::Nack(NackReason::UnknownSession)
@@ -1036,6 +1506,9 @@ impl EndpointInner {
             }) => self.handle_route_update(session_id, generation, route_blob),
             Ok(frame) => {
                 let session = lock(&self.state).sessions.get(&frame.session_id()).cloned();
+                if let Some(s) = &session {
+                    self.heard_from(s);
+                }
                 match session {
                     // Enqueued frames are answered by the session's pump.
                     Some(s) => match s.enqueue(call.id(), frame) {
@@ -1050,6 +1523,18 @@ impl EndpointInner {
     }
 
     fn handle_route_change(self: &Arc<Self>, change: &VeilidRouteChange) {
+        /// What to do with a session whose route was reported dead.
+        enum Detached {
+            /// Its OPEN is pending: fail it.
+            Opening,
+            /// Re-import the saved blob (the peer was heard from since the
+            /// previous re-import).
+            Reimport,
+            /// The peer has been silent since the previous re-import:
+            /// presume it gone.
+            Silent,
+        }
+
         let (detached, own_dead) = {
             let mut state = lock(&self.state);
             let mut detached = Vec::new();
@@ -1068,7 +1553,15 @@ impl EndpointInner {
                     if remote.id.as_ref() == Some(route) {
                         remote.id = None;
                         remote.epoch += 1;
-                        detached.push((s.clone(), remote.epoch));
+                        let action = if remote.opening {
+                            remote.died_while_opening = true;
+                            Detached::Opening
+                        } else if s.may_reimport(&remote) {
+                            Detached::Reimport
+                        } else {
+                            Detached::Silent
+                        };
+                        detached.push((s.clone(), remote.epoch, action));
                     }
                 }
             }
@@ -1076,20 +1569,37 @@ impl EndpointInner {
             (detached, own_dead)
         };
 
-        // Re-import each session's saved blob. Importing the same blob
-        // again yields the same `RouteId`; each session holds its own
-        // reference.
-        for (s, epoch) in &detached {
-            let installed = match self.import_route(&s.remote_blob()) {
-                Ok(route) => self.swap_route_if(s, *epoch, route).is_some(),
-                Err(e) => {
-                    tracing::debug!(session = %s.id, error = %e, "veilid: re-importing the peer's route failed");
-                    false
-                }
-            };
-            if installed {
-                tracing::info!(session = %s.id, "veilid: peer's private route reported dead; re-imported it, session continues");
+        for (s, epoch, action) in &detached {
+            // Closed (or closing) sessions are left alone.
+            if s.is_closed() {
                 continue;
+            }
+            match action {
+                Detached::Opening => {
+                    tracing::info!(session = %s.id, "veilid: peer's private route reported dead while our OPEN was pending; failing the OPEN");
+                    self.close_session(s, CLOSE_INTERNAL, "peer's route died during OPEN", false);
+                    continue;
+                }
+                // Importing the same blob again yields the same `RouteId`;
+                // each session holds its own reference.
+                Detached::Reimport => match self.import_route(&s.remote_blob()) {
+                    Ok(route) => {
+                        if self.install_reimport(s, *epoch, route).is_some() {
+                            tracing::info!(session = %s.id, "veilid: peer's private route reported dead; re-imported it, session continues");
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(session = %s.id, error = %e, "veilid: re-importing the peer's route failed");
+                    }
+                },
+                Detached::Silent => {
+                    tracing::info!(
+                        session = %s.id,
+                        silent_for = ?s.silent_for(),
+                        "veilid: peer's private route reported dead again without the peer being heard from since the last re-import; not re-importing it"
+                    );
+                }
             }
             // Either still lost, or a ROUTE_UPDATE got in first (then the
             // deadline sees a newer epoch and does nothing).
@@ -1100,7 +1610,7 @@ impl EndpointInner {
                     "veilid: peer's private route died; waiting for the peer to announce a new one"
                 );
             }
-            self.spawn_route_recovery_deadline(s, *epoch);
+            self.route_lost(s, *epoch);
         }
 
         if own_dead && !self.is_closed() && !self.reallocating.swap(true, Ordering::AcqRel) {
@@ -1211,8 +1721,16 @@ impl EndpointInner {
         Ok(keys)
     }
 
-    /// Resolve `address` to the peer's current route blob.
+    /// Resolve `address` to the peer's current route blob, within
+    /// [`EndpointConfig::resolve_timeout`].
     async fn resolve(&self, address: &VeilidAddress) -> Result<Vec<u8>, ResolveError> {
+        let timeout = self.config.resolve_timeout;
+        tokio::time::timeout(timeout, self.resolve_unbounded(address))
+            .await
+            .unwrap_or(Err(ResolveError::Timeout(timeout)))
+    }
+
+    async fn resolve_unbounded(&self, address: &VeilidAddress) -> Result<Vec<u8>, ResolveError> {
         let key = match address {
             VeilidAddress::RouteBlob(blob) => return Ok(blob.clone()),
             VeilidAddress::Record(key) => key,
@@ -1236,6 +1754,106 @@ impl EndpointInner {
         }
         let value = value?.ok_or(ResolveError::NotPublished)?;
         decode_record_value(value.data())
+    }
+}
+
+/// Body of [`EndpointInner::spawn_recovery`]: recovery rounds while
+/// `session`'s route stays lost, until the route is back, the session or
+/// endpoint closes, or the peer is found to have restarted.
+async fn recover_lost_route(endpoint: &Weak<EndpointInner>, session: &Weak<SessionShared>) {
+    loop {
+        // Bound the frequency (per session, across losses).
+        let wait = match (endpoint.upgrade(), session.upgrade()) {
+            (Some(ep), Some(s)) => lock(&s.last_recovery).map_or(Duration::ZERO, |last| {
+                (last + ep.config.recovery_interval())
+                    .saturating_duration_since(tokio::time::Instant::now())
+            }),
+            _ => return,
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        let (Some(ep), Some(s)) = (endpoint.upgrade(), session.upgrade()) else {
+            return;
+        };
+        if ep.is_closed() || s.is_closed() {
+            return;
+        }
+        let (epoch, authority, saved) = {
+            let remote = lock(&s.remote);
+            if remote.id.is_some() {
+                return; // the route came back
+            }
+            (remote.epoch, remote.authority, remote.blob.clone())
+        };
+        *lock(&s.last_recovery) = Some(tokio::time::Instant::now());
+        let ping = encode_ping(s.id);
+
+        // 1. Is the peer still reachable over its saved route (only our copy
+        //    of it was dropped, or both sides lost each other at once)?
+        match ep.probe(&s, &saved, &ping).await {
+            Probe::Alive(route) => {
+                if ep.install_reimport(&s, epoch, route).is_some() {
+                    s.mark_heard();
+                    tracing::info!(session = %s.id, "veilid: peer answered over its saved route; route recovered");
+                }
+                return;
+            }
+            Probe::Gone => {
+                peer_restarted(&ep, &s);
+                return;
+            }
+            Probe::Unreachable => {}
+        }
+        if s.is_closed() || s.current_route().is_some() {
+            return;
+        }
+
+        // 2. Dialled by address: has the peer published a different route
+        //    (it restarted or moved)? Only a route the peer answers over is
+        //    installed: the address may lag behind a ROUTE_UPDATE we already
+        //    have, and a stale blob must never replace the current one.
+        let Some(address) = s.address.clone() else {
+            continue;
+        };
+        let timeout = ep.config.call_timeout.min(ep.config.resolve_timeout);
+        let resolved = tokio::time::timeout(timeout, ep.resolve(&address)).await;
+        match resolved {
+            Ok(Ok(blob)) if blob != saved => match ep.probe(&s, &blob, &ping).await {
+                Probe::Alive(route) => {
+                    if ep.install_resolved(&s, authority, route, blob) {
+                        s.mark_heard();
+                        tracing::info!(session = %s.id, address = %address, "veilid: peer answers at the new route its address resolves to; switched the session to it");
+                    }
+                    return;
+                }
+                Probe::Gone => {
+                    peer_restarted(&ep, &s);
+                    return;
+                }
+                Probe::Unreachable => {
+                    tracing::debug!(session = %s.id, "veilid: peer does not answer at the route its address resolves to");
+                }
+            },
+            Ok(Ok(_)) => {
+                tracing::debug!(session = %s.id, "veilid: peer's address still holds the lost route");
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(session = %s.id, error = %e, "veilid: re-resolving the peer's address failed");
+            }
+            Err(_) => {
+                tracing::debug!(session = %s.id, "veilid: re-resolving the peer's address timed out");
+            }
+        }
+    }
+}
+
+/// A probe found that the peer of `session` no longer knows it: it
+/// restarted. Close the session so it can be redialled.
+fn peer_restarted(ep: &Arc<EndpointInner>, s: &Arc<SessionShared>) {
+    if !s.is_closed() {
+        tracing::info!(session = %s.id, "veilid: peer no longer knows the session (it restarted); closing it");
+        ep.close_session(s, CLOSE_NORMAL, "peer no longer knows the session", false);
     }
 }
 
@@ -1501,6 +2119,30 @@ async fn dispatch_loop(endpoint: Weak<EndpointInner>, rx: async_channel::Receive
     // The endpoint is gone: stop the dispatcher queueing (and warning about)
     // updates nobody will process.
     rx.close();
+}
+
+/// Closes a session whose [`EndpointInner::open_session`] was cancelled
+/// before handing it to a [`Session`].
+struct OpenGuard {
+    endpoint: Arc<EndpointInner>,
+    session: Arc<SessionShared>,
+    armed: bool,
+}
+
+impl OpenGuard {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::debug!(session = %self.session.id, "veilid: opening session cancelled; closing it");
+            self.endpoint
+                .close_session(&self.session, CLOSE_INTERNAL, "open cancelled", false);
+        }
+    }
 }
 
 /// Shuts a Veilid API down if [`VeilidEndpoint::start_until`] is dropped
@@ -1813,12 +2455,19 @@ impl VeilidEndpoint {
     /// # Errors
     ///
     /// Fails if the blob cannot be imported, the session limit is reached,
-    /// or the peer does not acknowledge the OPEN.
+    /// the peer's route is dead ([`ConnectError::RouteDead`]), or the peer
+    /// does not acknowledge the OPEN within
+    /// [`EndpointConfig::open_timeout`] ([`ConnectError::OpenTimeout`]).
     pub async fn open_session(&self, remote_route_blob: &[u8]) -> Result<Session, ConnectError> {
-        self.inner.open_session(remote_route_blob).await
+        self.inner.open_session(remote_route_blob, None).await
     }
 
     /// [Resolve](Self::resolve) `address` and open a session to it.
+    ///
+    /// The session remembers a DHT address: if the peer's route is later
+    /// lost, the address is re-resolved, so a peer that restarted or moved is
+    /// found again (or, if it restarted, the session closes promptly and can
+    /// be redialled).
     ///
     /// # Errors
     ///
@@ -1826,7 +2475,7 @@ impl VeilidEndpoint {
     /// [`open_session`](Self::open_session).
     pub async fn open_session_to(&self, address: &VeilidAddress) -> Result<Session, ConnectError> {
         let blob = self.resolve(address).await?;
-        self.open_session(&blob).await
+        self.inner.open_session(&blob, Some(address.clone())).await
     }
 
     /// Wait for the next inbound session.
@@ -1978,6 +2627,11 @@ mod tests {
         assert!(c.max_send_attempts >= 1);
         assert!(c.initial_backoff <= c.max_backoff);
         assert_eq!(c.route_recovery_timeout, DEFAULT_ROUTE_RECOVERY_TIMEOUT);
+        assert_eq!(c.open_timeout, DEFAULT_OPEN_TIMEOUT);
+        // A send is bounded, and outlasts its own retries plus recovery.
+        assert!(c.send_deadline() >= c.call_timeout * c.max_send_attempts);
+        assert!(c.send_deadline() >= c.route_recovery_timeout);
+        assert!(c.send_deadline() < Duration::from_secs(600));
         assert!(c.publish_address);
         assert_eq!(c.address_key_store, AddressKeyStore::TableStore);
     }

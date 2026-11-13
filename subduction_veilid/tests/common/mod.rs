@@ -8,8 +8,8 @@
 
 use std::{
     sync::{
-        OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -99,21 +99,31 @@ pub fn payload(len: usize, seed: u8) -> Vec<u8> {
 
 /// An endpoint bound (in "bring your own node" mode) to a Veilid node whose
 /// updates go through `dispatcher`, so tests can inject synthetic updates
-/// such as route changes.
+/// such as route changes, and make the node [go silent](Self::go_silent).
+#[derive(Clone)]
 pub struct BoundEndpoint {
     pub endpoint: VeilidEndpoint,
     pub dispatcher: VeilidDispatcher,
+    /// Updates reach the dispatcher only while set.
+    alive: Arc<AtomicBool>,
 }
 
 impl BoundEndpoint {
     pub async fn start(config: EndpointConfig) -> Self {
         let dispatcher = VeilidDispatcher::new();
-        let api = subduction_veilid::veilid_core::api_startup(
-            dispatcher.update_callback(None),
-            unique_veilid_config(),
-        )
-        .await
-        .expect("start veilid node");
+        let alive = Arc::new(AtomicBool::new(true));
+        let callback: subduction_veilid::veilid_core::UpdateCallback = {
+            let dispatcher = dispatcher.clone();
+            let alive = alive.clone();
+            Arc::new(move |update| {
+                if alive.load(Ordering::Acquire) {
+                    let _passed_on = dispatcher.handle_update(update);
+                }
+            })
+        };
+        let api = subduction_veilid::veilid_core::api_startup(callback, unique_veilid_config())
+            .await
+            .expect("start veilid node");
         api.attach().await.expect("attach");
         let endpoint = VeilidEndpoint::bind(api, &dispatcher, config)
             .await
@@ -121,7 +131,20 @@ impl BoundEndpoint {
         Self {
             endpoint,
             dispatcher,
+            alive,
         }
+    }
+
+    /// Simulate a crashed (or unreachable) node: its routes stay valid but
+    /// nothing it receives is processed or answered, and it sends no CLOSE.
+    pub fn go_silent(&self) {
+        self.alive.store(false, Ordering::Release);
+    }
+
+    /// Undo [`go_silent`](Self::go_silent): updates reach the endpoint
+    /// again (whatever arrived meanwhile was lost).
+    pub fn go_live(&self) {
+        self.alive.store(true, Ordering::Release);
     }
 
     /// Inject a `RouteChange` as Veilid would deliver it.

@@ -173,6 +173,11 @@ pub enum ResolveError {
     /// The record does not contain a route blob in a format we understand.
     #[error("address record has an unsupported format")]
     Malformed,
+
+    /// Resolving took longer than
+    /// [`EndpointConfig::resolve_timeout`](crate::endpoint::EndpointConfig::resolve_timeout).
+    #[error("resolving the address took longer than {0:?}")]
+    Timeout(core::time::Duration),
 }
 
 /// Encode a route blob as the value of an address record (subkey 0).

@@ -181,7 +181,10 @@ async fn address_is_republished_after_route_reallocation() -> TestResult {
     // A stale blob no longer works, but the address does.
     let err = client.open_session(&old_blob).await.unwrap_err();
     assert!(
-        matches!(err, ConnectError::InvalidRoute(_) | ConnectError::Open(_)),
+        matches!(
+            err,
+            ConnectError::InvalidRoute(_) | ConnectError::RouteDead(_) | ConnectError::Open(_)
+        ),
         "unexpected: {err:?}"
     );
     let (opened, accepted) = step("open by address + accept", async {

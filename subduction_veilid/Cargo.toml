@@ -67,5 +67,9 @@ required-features = ["server"]
 name = "address"
 required-features = ["server"]
 
+[[test]]
+name = "liveness"
+required-features = ["server"]
+
 [lints]
 workspace = true

@@ -260,7 +260,10 @@ async fn endpoint_shutdown_closes_sessions_and_accept() -> TestResult {
     // The server's route is gone.
     let err = client.open_session(&server.route_blob()).await.unwrap_err();
     assert!(
-        matches!(err, ConnectError::InvalidRoute(_) | ConnectError::Open(_)),
+        matches!(
+            err,
+            ConnectError::InvalidRoute(_) | ConnectError::RouteDead(_) | ConnectError::Open(_)
+        ),
         "unexpected error: {err:?}"
     );
 

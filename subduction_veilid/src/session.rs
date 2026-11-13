@@ -30,7 +30,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 use std::sync::Mutex;
@@ -38,6 +38,7 @@ use std::sync::Mutex;
 use veilid_core::{OperationId, RouteId};
 
 use crate::{
+    address::VeilidAddress,
     endpoint::{EndpointInner, lock},
     error::StreamError,
     frame::{Frame, MAX_CHUNK_SIZE, NackReason, Reply, SessionId, encode_data, encode_ping},
@@ -92,6 +93,21 @@ pub(crate) struct RemoteRoute {
     /// recovery deadline close the session only if it is still the same
     /// loss.
     pub(crate) epoch: u64,
+    /// Incremented only when an _authoritative_ new route is installed: a
+    /// `ROUTE_UPDATE` from the peer, or a different blob freshly resolved
+    /// from the peer's address. Only such a change gives an in-flight send
+    /// a fresh attempt budget; re-importing the saved blob does not (so a
+    /// truly dead peer cannot keep a send retrying forever).
+    pub(crate) authority: u64,
+    /// [`SessionShared::heard`] when the saved blob was last re-imported.
+    /// The blob is re-imported again only once we have heard from the peer
+    /// since (see [`SessionShared::may_reimport`]).
+    pub(crate) heard_at_reimport: u64,
+    /// Our OPEN has not been acknowledged yet (initiator only). Such a
+    /// session gets no route recovery: a dead route fails the OPEN.
+    pub(crate) opening: bool,
+    /// The peer's route was reported dead while the OPEN was pending.
+    pub(crate) died_while_opening: bool,
 }
 
 /// State shared between the endpoint's session table, the pump, and the
@@ -112,6 +128,26 @@ pub(crate) struct SessionShared {
 
     /// Whether we opened this session.
     pub(crate) initiator: bool,
+
+    /// The DHT address we dialled to open this session (initiator only, and
+    /// only for [`VeilidAddress::Record`]): re-resolved when the peer's
+    /// route is lost, to find a peer that restarted or moved.
+    pub(crate) address: Option<VeilidAddress>,
+
+    /// A task recovering the lost peer route (probing it, re-resolving
+    /// `address`) is running.
+    pub(crate) recovering: AtomicBool,
+
+    /// When the last recovery round started (bounds the probe and
+    /// re-resolve frequency).
+    pub(crate) last_recovery: Mutex<Option<tokio::time::Instant>>,
+
+    /// Count of frames, ACKs and NACKs received from the peer on this
+    /// session: evidence the peer is alive.
+    heard: AtomicU64,
+
+    /// When we last heard from the peer (frame, ACK, or NACK).
+    last_heard: Mutex<tokio::time::Instant>,
 
     /// Reassembled messages: pump -> [`Session::recv`].
     inbound_tx: async_channel::Sender<Vec<u8>>,
@@ -137,6 +173,7 @@ impl SessionShared {
         remote_blob: Vec<u8>,
         initiator: bool,
         inbound_capacity: usize,
+        address: Option<VeilidAddress>,
     ) -> (Arc<Self>, async_channel::Receiver<QueuedFrame>) {
         let (inbound_tx, inbound_rx) = async_channel::bounded(inbound_capacity.max(1));
         let (frames_tx, frames_rx) = async_channel::bounded(FRAME_QUEUE_CAPACITY);
@@ -148,10 +185,21 @@ impl SessionShared {
                 blob: remote_blob,
                 generation: 0,
                 epoch: 0,
+                authority: 0,
+                heard_at_reimport: 0,
+                opening: initiator,
+                died_while_opening: false,
             }),
             route_changed: tokio::sync::Notify::new(),
             open_blob,
             initiator,
+            address: address.filter(VeilidAddress::is_record),
+            recovering: AtomicBool::new(false),
+            last_recovery: Mutex::new(None),
+            // A responder has just heard the peer's OPEN; an initiator hears
+            // from the peer once its OPEN is acknowledged.
+            heard: AtomicU64::new(u64::from(!initiator)),
+            last_heard: Mutex::new(tokio::time::Instant::now()),
             inbound_tx,
             inbound_rx,
             queued_bytes: AtomicUsize::new(0),
@@ -168,10 +216,39 @@ impl SessionShared {
         lock(&self.remote).id.clone()
     }
 
-    /// The current route and its epoch (`None` while the route is lost).
-    pub(crate) fn current_route_epoch(&self) -> Option<(RouteId, u64)> {
+    /// The current route with its epoch and authority (`None` while the
+    /// route is lost).
+    pub(crate) fn current_route_epoch(&self) -> Option<(RouteId, u64, u64)> {
         let remote = lock(&self.remote);
-        remote.id.clone().map(|id| (id, remote.epoch))
+        remote
+            .id
+            .clone()
+            .map(|id| (id, remote.epoch, remote.authority))
+    }
+
+    /// Record that the peer just showed signs of life (a frame, ACK, or
+    /// NACK arrived for this session).
+    pub(crate) fn mark_heard(&self) {
+        self.heard.fetch_add(1, Ordering::AcqRel);
+        *lock(&self.last_heard) = tokio::time::Instant::now();
+    }
+
+    /// How many times we have heard from the peer.
+    pub(crate) fn heard(&self) -> u64 {
+        self.heard.load(Ordering::Acquire)
+    }
+
+    /// How long ago we last heard from the peer.
+    pub(crate) fn silent_for(&self) -> Duration {
+        lock(&self.last_heard).elapsed()
+    }
+
+    /// Whether the saved blob may be re-imported (`remote` is this session's
+    /// locked route state): only if we have heard from the peer since the
+    /// previous re-import (or, for the first one, since the session
+    /// started). Otherwise the peer is presumed gone and its route lost.
+    pub(crate) fn may_reimport(&self, remote: &RemoteRoute) -> bool {
+        self.heard() > remote.heard_at_reimport
     }
 
     /// The peer's latest route blob.
@@ -392,8 +469,10 @@ pub(crate) async fn keepalive(
         }
         let ping = encode_ping(shared.id);
         // While the peer's route is lost this waits for it to come back (or
-        // for the recovery deadline to close the session) instead of failing.
-        if let Err(e) = ep.call_session(&shared, &ping).await {
+        // for the recovery deadline to close the session). Otherwise it
+        // gets the attempts of any frame, so a few lost replies never close
+        // a live session.
+        if let Err(e) = ep.ping_session(&shared, &ping).await {
             if let Some((code, notify)) = failure_close(&e) {
                 tracing::info!(session = %shared.id, error = %e, "veilid: keepalive failed; closing session");
                 ep.close_session(&shared, code, &e.to_string(), notify);
@@ -546,7 +625,10 @@ impl Session {
     /// If the peer's route fails or is reported dead, the route is
     /// re-imported, and if that does not help the send waits (for up to
     /// [`route_recovery_timeout`](crate::endpoint::EndpointConfig::route_recovery_timeout))
-    /// for the peer to announce a new route.
+    /// for the peer to announce a new route. Each fragment is bounded
+    /// overall by
+    /// [`send_deadline`](crate::endpoint::EndpointConfig::send_deadline)
+    /// (busy waits excluded).
     ///
     /// # Errors
     ///
